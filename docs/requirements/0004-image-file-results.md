@@ -4,7 +4,7 @@ Status: pending-verification
 
 - Owner: image protocol services
 - Created: 2026-11-17
-- Updated: 2026-11-17
+- Updated: 2026-11-18
 - Related ADRs: 0002, 0003
 
 ## Problem and user outcome
@@ -52,6 +52,10 @@ images. User attachments, other branches, previous turns, arbitrary text URLs,
 and intermediate tool files do not qualify. Explicit policy failures remain
 failures. File resolution is bound to conversation ID and message ID. Missing
 files and invalid image bodies are delivery failures, not invalid accounts.
+Temporarily missing URLs receive up to four same-conversation probes, retaining
+resolved URLs, within 30 seconds and the remaining request/poll deadline.
+Authentication failures stop immediately. Log normalization preserves delivered
+counts and superseded dispositions; retry sleep is counted only as polling wait.
 Public asset downloads use public DNS address pinning, no account credentials,
 bounded redirects, timeouts and byte limits. Valid results survive another
 variant's text-only failure. Existing account slot cleanup remains authoritative.
@@ -66,15 +70,17 @@ variant's text-only failure. Existing account slot cleanup remains authoritative
 | Missing files/HTML/private redirects are rejected | Download regression | passed |
 | Singles and later groups respect count and partial results | Group-selection and log-projection regression | passed |
 | Log details satisfy the strict HTTP response contract | CallDetail validation for grouped and superseded attempts | passed |
-| Existing backend behavior | Complete local pytest suite, 44 passed | passed |
+| File readiness and log normalization | Same-conversation retry, deadline, authentication, timing and LoggedCall storage-boundary regression | passed |
+| Existing backend behavior | Complete local pytest suite, 50 passed | passed |
 | Historical file recovery with the new methods | Separate server process resolved and decoded 3 WebP files, without changing the running service | passed |
-| Fresh generation and user outcome after rollout | Live request and user verification | pending |
+| Fresh generation before readiness retry fix | One HTTP request returned three decoded WebP images in 107.6 seconds after one account switch | passed |
+| Fresh generation after readiness retry fix and user outcome | Live request and user verification | pending |
 
 The six final-reply files from the two historical text-only attempts were also
 independently downloaded and verified. This establishes recoverable artifacts,
 not that every future upstream generation will produce the intended image set.
-The implementation checks above did not include browser inspection or a
-production rollout. Rollout verification is separate from user acceptance.
+The checks above did not include browser inspection. Rollout verification is
+separate from user acceptance.
 
 ## Documentation and rollback
 

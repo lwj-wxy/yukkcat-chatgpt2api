@@ -118,10 +118,14 @@ from one conversation and supersedes earlier singles; otherwise accumulated
 single-image variants are delivered after the execution slots finish.
 `OpenAIBackendAPI` resolves final assistant sandbox images through their
 conversation and message IDs, validates downloads, and hands bytes to the
-existing image formatting/storage path. It reuses current-turn selection from
+existing image formatting/storage path. Missing file URLs are retried in the
+same conversation for at most four probes within 30 seconds and the remaining
+request/poll budget; already resolved URLs are retained. Authentication failures
+stop immediately. Retry sleeps count as polling wait, not URL resolution time.
+It reuses current-turn selection from
 `image_failure` and public URL/DNS validation from `utils/image_download_urls`.
 Call Record attempts carry `result_image_count` and an optional
-`result_disposition=superseded`; the backend groups their labels without
+`result_disposition=superseded` through log normalization and storage; the backend groups their labels without
 fabricating extra attempts or counting unselected candidates as delivered.
 
 ## Call Record, live monitor, and metrics

@@ -143,10 +143,12 @@ IMAGE_ATTEMPT_KEYS = {
     "switched_account",
     "conversation_id",
     "duration_ms",
+    "result_image_count",
+    "result_disposition",
     "monitor",
 }
 IMAGE_ATTEMPT_INTEGER_KEYS = {
-    "slot", "attempt", "duration_ms", "status_code", "failure_retry_after",
+    "slot", "attempt", "duration_ms", "status_code", "failure_retry_after", "result_image_count",
 }
 IMAGE_ATTEMPT_BOOLEAN_KEYS = {
     "failure_retryable", "failure_account_failure", "account_failure", "switched_account",
@@ -243,6 +245,9 @@ def _normalize_image_attempt(value: object) -> dict[str, object] | None:
             monitor = _normalize_image_attempt_monitor(item)
             if monitor:
                 attempt[key] = monitor
+        elif key == "result_disposition":
+            if item == "superseded":
+                attempt[key] = item
         elif key in IMAGE_ATTEMPT_INTEGER_KEYS:
             parsed = _normalize_image_attempt_int(key, item)
             if parsed is not None:

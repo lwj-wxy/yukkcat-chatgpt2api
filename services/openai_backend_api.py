@@ -3005,27 +3005,55 @@ class OpenAIBackendAPI:
         paths = list(dict.fromkeys(SANDBOX_IMAGE_RE.findall(self._editable_message_text(message))))
         if len(paths) > config.image_max_n:
             raise ImageDownloadError("image file group exceeds the configured image limit")
-        urls: list[str] = []
+        artifacts: list[EditableFileArtifact] = []
         for raw_path in paths:
             path = unquote(raw_path)
             if (not path.startswith("/mnt/data/") or ".." in PurePosixPath(path).parts
                     or "\\" in path or "%" in path or any(ord(char) < 32 for char in path)):
                 raise ImageDownloadError("invalid sandbox image path")
-            artifact = EditableFileArtifact(
+            artifacts.append(EditableFileArtifact(
                 name=PurePosixPath(path).name, sandbox_path=path,
                 message_id=message_id, author_role="assistant",
-            )
-            try:
-                url = self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline)
-            except Exception as exc:
-                failure = classify_image_exception(exc)
-                if failure.capability == "auth":
-                    raise
-                raise ImageDownloadError("could not resolve a conversation image file") from exc
-            if not url:
-                raise ImageDownloadError("conversation image file is unavailable")
-            urls.append(url)
-        return urls
+            ))
+        if not artifacts:
+            return []
+        # A terminal reply may precede publication of its files. Keep the same
+        # conversation/message and retry only missing URLs before regenerating.
+        deadline = min(deadline, time.monotonic() + 30.0,
+                       getattr(self, "deadline_monotonic", None) or deadline)
+        resolved: dict[str, str] = {}
+        for probe in range(4):
+            for artifact in artifacts:
+                if artifact.sandbox_path in resolved:
+                    continue
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    url = self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline)
+                except Exception as exc:
+                    failure = classify_image_exception(exc)
+                    if failure.capability == "auth":
+                        raise
+                    if not failure.retryable:
+                        raise ImageDownloadError("could not resolve a conversation image file") from exc
+                    url = ""
+                if url:
+                    resolved[artifact.sandbox_path] = url
+            if len(resolved) == len(artifacts):
+                return [resolved[artifact.sandbox_path] for artifact in artifacts]
+            remaining = deadline - time.monotonic()
+            if probe == 3 or remaining <= 0:
+                break
+            wait = min(2.0 ** (probe + 1), remaining)
+            logger.info({
+                "event": "image_file_resolution_retry", "conversation_id": conversation_id,
+                "attempt": probe + 1, "pending_count": len(artifacts) - len(resolved),
+                "sleep_secs": round(wait, 3),
+            })
+            self._sleep_for_image_poll(wait)
+        error = ImageDownloadError("conversation image file is unavailable after bounded retries")
+        error.conversation_id = conversation_id
+        raise error
 
     def _poll_image_results(
             self,
@@ -3282,12 +3310,16 @@ class OpenAIBackendAPI:
             terminal_failure = merge_message_failure(pending_task_failure, conversation_failure)
             if terminal_failure is None or terminal_failure.code == "upstream_text_reply":
                 resolve_started = time.perf_counter()
+                wait_before = self._image_result_timing.get("poll_wait_ms", 0)
                 try:
                     sandbox_urls = self._resolve_sandbox_image_urls(
                         conversation_id, conversation, deadline=started_at + timeout_secs,
                     )
                 finally:
-                    self._add_image_result_timing("resolve_ms", (time.perf_counter() - resolve_started) * 1000)
+                    retry_wait = self._image_result_timing.get("poll_wait_ms", 0) - wait_before
+                    self._add_image_result_timing(
+                        "resolve_ms", (time.perf_counter() - resolve_started) * 1000 - retry_wait,
+                    )
                 if sandbox_urls:
                     return [], [], sandbox_urls
 
