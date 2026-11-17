@@ -4217,10 +4217,10 @@ class AccountService:
                     )
                     raise rejected_error
 
-                if not allow_refresh_token_exchange:
-                    refresh_token_can_recover = bool(rejected_snapshot[1]) and not bool(
-                        (current_account or {}).get("refresh_token_invalid_at")
-                    )
+                refresh_token_can_recover = bool(rejected_snapshot[1]) and not bool(
+                    (current_account or {}).get("refresh_token_invalid_at")
+                )
+                if not allow_refresh_token_exchange or not refresh_token_can_recover:
                     self.handle_invalid_token(
                         rejected_snapshot[0],
                         event,
@@ -4232,13 +4232,11 @@ class AccountService:
                     )
                     raise rejected_error
 
-                before_refresh = self.get_account(rejected_snapshot[0]) or {}
-                before_refresh_at = str(before_refresh.get("last_token_refresh_at") or "")
-                before_error_at = str(before_refresh.get("last_token_refresh_error_at") or "")
                 try:
                     active_token = self.force_refresh_access_token(
                         rejected_snapshot[0],
                         event=f"{event}:invalid_access_token",
+                        raise_on_error=True,
                         expected_credentials=(
                             rejected_snapshot[0],
                             rejected_snapshot[1],
@@ -4261,34 +4259,17 @@ class AccountService:
                 except RefreshCredentialsChangedError:
                     raise
                 except Exception as refresh_exc:
-                    self._record_remote_check_error(
+                    # The AT was rejected, but a transient exchange failure does not invalidate the RT.
+                    self.handle_invalid_token(
                         rejected_snapshot[0],
                         event,
-                        str(refresh_exc),
+                        error=str(rejected_error),
+                        remove=False,
                         expected_access_token=rejected_snapshot[0],
                         expected_refresh_token=rejected_snapshot[1],
                         expected_remote_check_marker=rejected_remote_check_marker,
                     )
-                    raise
-
-                after_refresh = self.get_account(active_token or rejected_snapshot[0]) or {}
-                after_refresh_at = str(after_refresh.get("last_token_refresh_at") or "")
-                after_error_at = str(after_refresh.get("last_token_refresh_error_at") or "")
-                refresh_failed = bool(after_error_at and after_error_at != before_error_at)
-                refresh_succeeded = bool(after_refresh_at and after_refresh_at != before_refresh_at)
-                if refresh_failed and not refresh_succeeded:
-                    self._record_remote_check_error(
-                        rejected_snapshot[0],
-                        event,
-                        str(
-                            after_refresh.get("last_token_refresh_error")
-                            or "refresh token failed"
-                        ),
-                        expected_access_token=rejected_snapshot[0],
-                        expected_refresh_token=rejected_snapshot[1],
-                        expected_remote_check_marker=rejected_remote_check_marker,
-                    )
-                    raise rejected_error
+                    raise rejected_error from refresh_exc
 
                 verification_token, verification_refresh_token, verification_account = (
                     self._credential_snapshot(active_token)

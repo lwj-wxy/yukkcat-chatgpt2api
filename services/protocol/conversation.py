@@ -2521,66 +2521,70 @@ def _generate_single_image(
                     total=total,
                 )
 
-        account_wait_ms = int((time.perf_counter() - account_wait_started) * 1000)
-        account = account_service.get_account(token) or {}
-        attempt_refresh_token = str(account.get("refresh_token") or "").strip()
-        attempt_last_token_refresh_at = account.get("last_token_refresh_at")
-        account_email = str(account.get("email") or "").strip()
-        if pending_switch_attempt_index is not None:
-            previous_attempt = image_attempts[pending_switch_attempt_index]
-            previous_attempt["switched_account"] = True
-            logger.warning({
-                "event": "image_cross_account_retry",
+        try:
+            account_wait_ms = int((time.perf_counter() - account_wait_started) * 1000)
+            account = account_service.get_account(token) or {}
+            attempt_refresh_token = str(account.get("refresh_token") or "").strip()
+            attempt_last_token_refresh_at = account.get("last_token_refresh_at")
+            account_email = str(account.get("email") or "").strip()
+            if pending_switch_attempt_index is not None:
+                previous_attempt = image_attempts[pending_switch_attempt_index]
+                previous_attempt["switched_account"] = True
+                logger.warning({
+                    "event": "image_cross_account_retry",
+                    "call_id": request.call_id,
+                    "failure_code": previous_attempt.get("failure_code", ""),
+                    "account_email": previous_attempt.get("account_email", ""),
+                    "next_account_email": account_email,
+                    "attempted_account_count": len(image_attempts) + 1,
+                    "max_account_attempts": max_account_attempts,
+                    "index": index,
+                })
+                if request.trace_image_perf:
+                    _monitor_image_stage(
+                        request,
+                        "image_cross_account_retry",
+                        status="retrying",
+                        failure_code=previous_attempt.get("failure_code", ""),
+                        account_email=account_email,
+                        previous_account_email=previous_attempt.get("account_email", ""),
+                        account_switch_count=len(image_attempts),
+                        max_account_attempts=max_account_attempts,
+                        index=index,
+                        total=total,
+                    )
+                pending_switch_attempt_index = None
+            retry_error = None
+            _monitor_image_stage(
+                request,
+                "image_account_lookup",
+                account_wait_ms=account_wait_ms,
+                account_email=account_email,
+                account_found=bool(account),
+                max_account_attempts=max_account_attempts,
+                index=index,
+                total=total,
+            )
+            if account_wait_ms >= 5000:
+                logger.warning({
+                    "event": "image_account_wait_slow",
+                    "call_id": request.call_id,
+                    "account_wait_ms": account_wait_ms,
+                    "account_email": account_email,
+                    "index": index,
+                })
+            logger.debug({
+                "event": "image_account_lookup",
                 "call_id": request.call_id,
-                "failure_code": previous_attempt.get("failure_code", ""),
-                "account_email": previous_attempt.get("account_email", ""),
-                "next_account_email": account_email,
-                "attempted_account_count": len(image_attempts) + 1,
-                "max_account_attempts": max_account_attempts,
-                "index": index,
-            })
-            if request.trace_image_perf:
-                _monitor_image_stage(
-                    request,
-                    "image_cross_account_retry",
-                    status="retrying",
-                    failure_code=previous_attempt.get("failure_code", ""),
-                    account_email=account_email,
-                    previous_account_email=previous_attempt.get("account_email", ""),
-                    account_switch_count=len(image_attempts),
-                    max_account_attempts=max_account_attempts,
-                    index=index,
-                    total=total,
-                )
-            pending_switch_attempt_index = None
-        retry_error = None
-        _monitor_image_stage(
-            request,
-            "image_account_lookup",
-            account_wait_ms=account_wait_ms,
-            account_email=account_email,
-            account_found=bool(account),
-            max_account_attempts=max_account_attempts,
-            index=index,
-            total=total,
-        )
-        if account_wait_ms >= 5000:
-            logger.warning({
-                "event": "image_account_wait_slow",
-                "call_id": request.call_id,
-                "account_wait_ms": account_wait_ms,
+                "token_prefix": token[:12] + "..." if len(token) > 12 else token,
                 "account_email": account_email,
+                "account_found": bool(account),
+                "account_wait_ms": account_wait_ms,
                 "index": index,
             })
-        logger.debug({
-            "event": "image_account_lookup",
-            "call_id": request.call_id,
-            "token_prefix": token[:12] + "..." if len(token) > 12 else token,
-            "account_email": account_email,
-            "account_found": bool(account),
-            "account_wait_ms": account_wait_ms,
-            "index": index,
-        })
+        except BaseException:
+            account_service.release_image_slot(token)
+            raise
         backend: OpenAIBackendAPI | None = None
         egress_acquired = False
         try:
@@ -2827,7 +2831,6 @@ def _generate_single_image(
             if early_connection_failure and fallback_reference and not fallback_retry_used:
                 fallback_retry_used = True
                 fallback_retry_pending = True
-                retry_token = token
                 fallback_from_egress = _backend_egress_data(backend) if backend is not None else {}
                 logger.warning({
                     "event": "image_stream_fallback_retry",
@@ -2851,6 +2854,7 @@ def _generate_single_image(
                         fallback_from_egress_key=fallback_from_egress.get("egress_key", ""),
                         fallback_from_egress_label=fallback_from_egress.get("egress_label", ""),
                     )
+                retry_token = token
                 continue
 
             if isinstance(exc, ImageGenerationError):
@@ -2929,10 +2933,20 @@ def _generate_single_image(
                 raise
             raise image_error from exc
         finally:
-            if egress_acquired and backend is not None:
-                proxy_settings.release_image_egress(backend.proxy_profile)
-            if backend is not None:
-                backend.close()
+            try:
+                try:
+                    if egress_acquired and backend is not None:
+                        proxy_settings.release_image_egress(backend.proxy_profile)
+                finally:
+                    if backend is not None:
+                        backend.close()
+            except BaseException:
+                # A cleanup error interrupts the retry that would inherit this slot.
+                retry_token = ""
+                raise
+            finally:
+                if not image_slot_finalized and not retry_token:
+                    account_service.release_image_slot(token)
 
 
 def _select_image_pool_error(errors: dict[int, Exception]) -> Exception | None:
