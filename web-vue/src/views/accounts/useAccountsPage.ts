@@ -268,6 +268,7 @@ export function useAccountsPage() {
     runBatchInteraction(() => accountBulkActions.runBulkAction(...args))
   )
   const bindSelectedAccountsToGroup = () => runBatchInteraction(accountBulkActions.bindSelectedAccountsToGroup)
+  const clearInvalidAccounts = () => runBatchInteraction(accountBulkActions.clearInvalidAccounts)
 
   async function copyAccountCredential(item: Account, kind: 'access' | 'refresh') {
     const label = kind === 'access' ? 'AT' : 'RT'
@@ -535,6 +536,7 @@ export function useAccountsPage() {
     runBulkAction,
     runMemoryAction,
     bindSelectedAccountsToGroup,
+    clearInvalidAccounts,
     exportAccounts,
   }
 }

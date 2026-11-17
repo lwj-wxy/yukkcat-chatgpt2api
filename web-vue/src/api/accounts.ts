@@ -325,6 +325,16 @@ type AccountImportCleanupResponse = {
   errors?: AccountMutationError[]
   events?: AccountOperationEvent[]
 }
+type InvalidAccountCleanupPreview = {
+  account_ids: string[]
+  abnormal: number
+  unknown_quota: number
+}
+type InvalidAccountCleanupResult = {
+  removed: number
+  removed_ids: string[]
+  skipped: number
+}
 type BackendAccountsResponse = {
   items?: Account[]
   total?: number
@@ -782,6 +792,30 @@ export const accountsApi = {
       uniqueStrings(tokens).map((accessToken) => ({ access_token: accessToken, source_type: sourceType })),
       sourceType,
     ),
+
+  previewInvalidAccountCleanup: async () => {
+    const result = await apiClient.get<unknown, InvalidAccountCleanupPreview>('/api/accounts/invalid-cleanup')
+    if (
+      !Array.isArray(result.account_ids) || !result.account_ids.every((id) => typeof id === 'string' && id.length > 0) ||
+      !Number.isSafeInteger(result.abnormal) || result.abnormal < 0 ||
+      !Number.isSafeInteger(result.unknown_quota) || result.unknown_quota < 0 ||
+      result.abnormal + result.unknown_quota !== result.account_ids.length
+    ) throw new Error('清除预览响应不完整')
+    return result
+  },
+
+  deleteInvalidAccounts: async (accountIds: string[]) => {
+    const result = await apiClient.post<
+      { account_ids: string[] }, InvalidAccountCleanupResult
+    >('/api/accounts/invalid-cleanup', { account_ids: accountIds })
+    if (
+      !Array.isArray(result.removed_ids) || !result.removed_ids.every((id) => typeof id === 'string' && id.length > 0) ||
+      result.removed !== result.removed_ids.length ||
+      !Number.isSafeInteger(result.skipped) || result.skipped < 0 ||
+      result.removed + result.skipped !== accountIds.length
+    ) throw new Error('清除结果响应不完整')
+    return result
+  },
 
   cleanupImportedAbnormalAccounts: async (accountIds: string[], remove = false) => {
     const ids = uniqueStrings(accountIds)

@@ -216,6 +216,16 @@ def account_status_category(account: dict[str, Any]) -> AccountStatusCategory:
     )
 
 
+def account_image_quota_state(
+    account: dict[str, Any], *, unlimited_quota: bool,
+) -> Literal["unlimited", "unknown", "exhausted", "available"]:
+    if unlimited_quota:
+        return "unlimited"
+    if account.get("image_quota_unknown"):
+        return "unknown"
+    return "available" if int(account.get("quota") or 0) > 0 else "exhausted"
+
+
 def account_memory_state(account: dict[str, Any]) -> Literal["enabled", "disabled", "unknown"]:
     value = account.get("memory_enabled")
     if value is True:
@@ -322,18 +332,8 @@ def account_row(
     proxy, proxy_mode, proxy_group_id, proxy_label = _proxy(account)
     quota_unknown = bool(account.get("image_quota_unknown"))
     quota_remaining = max(0, int(account.get("quota") or 0))
-    if unlimited_quota:
-        quota_state = "unlimited"
-        quota_label = "无限"
-    elif quota_unknown:
-        quota_state = "unknown"
-        quota_label = "未知"
-    elif quota_remaining <= 0:
-        quota_state = "exhausted"
-        quota_label = "0"
-    else:
-        quota_state = "available"
-        quota_label = str(quota_remaining)
+    quota_state = account_image_quota_state(account, unlimited_quota=unlimited_quota)
+    quota_label = {"unlimited": "无限", "unknown": "未知"}.get(quota_state, str(quota_remaining))
 
     email = _text(account.get("email"))
     user_id = _text(account.get("user_id"))

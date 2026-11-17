@@ -95,6 +95,15 @@
                 :trigger-class="accountToolbarMenuClass"
                 @select="handleBatchAction"
               />
+              <Button
+                size="sm"
+                variant="outline"
+                :root-class="accountToolbarButtonClass"
+                :disabled="importBusy || batchBusy || accountOperationBusy || accountAllTotal === 0"
+                @click="clearInvalidAccounts"
+              >
+                清除失效账号
+              </Button>
             </FilterToolbar>
           </div>
 
@@ -952,6 +961,7 @@ const {
   runBulkAction,
   runMemoryAction,
   bindSelectedAccountsToGroup,
+  clearInvalidAccounts,
   exportAccounts,
 } = useAccountsPage()
 

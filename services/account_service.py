@@ -28,6 +28,7 @@ from services.account_operation_events import (
     ACCOUNT_OPERATION_EVENT_LIMIT,
     normalize_account_operation_event,
 )
+from services.account_view import account_image_quota_state, account_status_category
 from services.config import config
 from services.image_failure import ImageFailure, classify_image_exception, image_failure
 from services.log_service import (
@@ -727,6 +728,7 @@ class AccountService:
         expected_credential_generation: _CredentialGeneration | None = None,
         expected_memory_operation: tuple[str, str] | None = None,
         conflict_existing_tokens: set[str] | None = None,
+        reject_conflict: bool = False,
     ) -> bool:
         last_conflict: StorageRevisionConflictError | None = None
         for attempt in range(self._STORAGE_MUTATION_MAX_ATTEMPTS):
@@ -742,7 +744,7 @@ class AccountService:
                 result = self.storage.mutate_accounts(mutation)
             except StorageRevisionConflictError as exc:
                 last_conflict = exc
-                if attempt + 1 >= self._STORAGE_MUTATION_MAX_ATTEMPTS:
+                if reject_conflict or attempt + 1 >= self._STORAGE_MUTATION_MAX_ATTEMPTS:
                     self._restore_accounts_after_save_error()
                     raise
                 try:
@@ -2912,6 +2914,36 @@ class AccountService:
             # The account store is authoritative; diagnostics must not reverse its outcome.
             pass
 
+    @classmethod
+    def _invalid_cleanup_reason(cls, account: dict[str, Any]) -> str | None:
+        if account_status_category(account) == "abnormal":
+            return "abnormal"
+        if account_image_quota_state(
+            account, unlimited_quota=cls.is_unlimited_image_quota_account(account),
+        ) == "unknown":
+            return "unknown_quota"
+        return None
+
+    def preview_invalid_cleanup(self) -> dict[str, Any]:
+        account_ids: list[str] = []
+        counts = {"abnormal": 0, "unknown_quota": 0}
+        for account in self.list_accounts():
+            account_id = str(account.get("management_id") or "").strip().lower()
+            if account_id and (reason := self._invalid_cleanup_reason(account)):
+                account_ids.append(account_id)
+                counts[reason] += 1
+        return {"account_ids": account_ids, **counts}
+
+    def delete_invalid_accounts(self, account_ids: list[str]) -> dict[str, Any]:
+        confirmed_ids = {item.strip().lower() for item in account_ids if item.strip()}
+        tokens, _ = self.resolve_account_ids(list(confirmed_ids))
+        result = self.delete_accounts(tokens, return_items=False, invalid_cleanup_ids=confirmed_ids)
+        return {
+            "removed": result["removed"],
+            "removed_ids": result["removed_ids"],
+            "skipped": len(confirmed_ids) - result["removed"],
+        }
+
     @account_processing_batch
     def delete_accounts(
         self,
@@ -2919,6 +2951,7 @@ class AccountService:
         return_items: bool = True,
         *,
         progress_callback: Callable[[str, int], None] | None = None,
+        invalid_cleanup_ids: set[str] | None = None,
     ) -> dict:
         requested_tokens = list(dict.fromkeys(token for token in tokens if token))
         if not requested_tokens:
@@ -2947,8 +2980,12 @@ class AccountService:
                 if account is None:
                     missing_tokens.append(requested_token)
                     continue
-                target_tokens.append(access_token)
                 management_id = str(account.get("management_id") or "").strip().lower()
+                if invalid_cleanup_ids is not None and (
+                    management_id not in invalid_cleanup_ids or not self._invalid_cleanup_reason(account)
+                ):
+                    continue
+                target_tokens.append(access_token)
                 if management_id:
                     candidate_ids.append(management_id)
 
@@ -2960,7 +2997,7 @@ class AccountService:
                     "save_accounts",
                     removed,
                 )
-                self._save_accounts()
+                self._save_accounts(reject_conflict=invalid_cleanup_ids is not None)
                 self._remove_account_runtime_state_locked(target_set)
                 self._add_account_log_best_effort(
                     f"删除 {removed} 个账号",

@@ -51,6 +51,7 @@ from services.sub2api_service import (
     sub2api_config,
     sub2api_import_service,
 )
+from services.storage.base import StorageRevisionConflictError
 from utils.diagnostics import sanitize_diagnostic_text
 from utils.helper import anonymize_token
 
@@ -100,6 +101,22 @@ class AccountImportCleanupRequest(BaseModel):
     access_tokens: list[str] = Field(default_factory=list)
     account_ids: list[str] = Field(default_factory=list)
     remove: bool = False
+
+
+class InvalidAccountCleanupRequest(BaseModel):
+    account_ids: list[str] = Field(min_length=1)
+
+
+class InvalidAccountCleanupPreview(BaseModel):
+    account_ids: list[str]
+    abnormal: int = Field(ge=0)
+    unknown_quota: int = Field(ge=0)
+
+
+class InvalidAccountCleanupResult(BaseModel):
+    removed: int = Field(ge=0)
+    removed_ids: list[str]
+    skipped: int = Field(ge=0)
 
 
 class AccountOperationRequest(BaseModel):
@@ -1244,6 +1261,22 @@ def create_router() -> APIRouter:
     ):
         require_admin(authorization)
         return await run_in_threadpool(_account_selection_preview, body.selection)
+
+    @router.get("/api/accounts/invalid-cleanup", response_model=InvalidAccountCleanupPreview)
+    async def preview_invalid_account_cleanup(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        return await run_in_threadpool(account_service.preview_invalid_cleanup)
+
+    @router.post("/api/accounts/invalid-cleanup", response_model=InvalidAccountCleanupResult)
+    async def delete_invalid_accounts(
+        body: InvalidAccountCleanupRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(account_service.delete_invalid_accounts, body.account_ids)
+        except StorageRevisionConflictError as exc:
+            raise HTTPException(status_code=409, detail={"error": "账号列表已变化，请重新预览后清除"}) from exc
 
     @router.get("/api/accounts/{account_id}")
     async def get_account_detail(account_id: str, authorization: str | None = Header(default=None)):
