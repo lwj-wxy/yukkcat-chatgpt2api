@@ -40,7 +40,9 @@ The system cannot infer that a native single image is an unwanted collage.
 | Public URL and DNS safety | utils/image_download_urls | validation and pinned curl options shared with input downloads |
 | Publication and catalogue | ImageStorageService | existing formatting/storage path |
 
-Public request/response shapes and frontend interactions remain unchanged.
+Public image request/response shapes and frontend interactions remain unchanged.
+The log attempt contract adds `result_image_count` and `result_disposition`,
+with defaults for attempts recorded before this change.
 No persistent schema changes and no new dependencies are required.
 
 ## Failure and security behavior
@@ -63,6 +65,7 @@ variant's text-only failure. Existing account slot cleanup remains authoritative
 | Previous/user/other-branch files cannot become outputs | Provenance regression | passed |
 | Missing files/HTML/private redirects are rejected | Download regression | passed |
 | Singles and later groups respect count and partial results | Group-selection and log-projection regression | passed |
+| Log details satisfy the strict HTTP response contract | CallDetail validation for grouped and superseded attempts | passed |
 | Existing backend behavior | Complete local pytest suite, 44 passed | passed |
 | Historical file recovery with the new methods | Separate server process resolved and decoded 3 WebP files, without changing the running service | passed |
 | Fresh generation and user outcome after rollout | Live request and user verification | pending |
@@ -70,7 +73,8 @@ variant's text-only failure. Existing account slot cleanup remains authoritative
 The six final-reply files from the two historical text-only attempts were also
 independently downloaded and verified. This establishes recoverable artifacts,
 not that every future upstream generation will produce the intended image set.
-No browser inspection or production deployment was performed for this change.
+The implementation checks above did not include browser inspection or a
+production rollout. Rollout verification is separate from user acceptance.
 
 ## Documentation and rollback
 
