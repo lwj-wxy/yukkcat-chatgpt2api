@@ -12,10 +12,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urljoin, urlparse
 
 from curl_cffi import CurlInfo, CurlOpt, requests
 from PIL import Image
@@ -30,6 +30,7 @@ from services.image_failure import (
     ImagePollTimeoutError,
     InvalidAccessTokenError,
     classify_conversation_failure,
+    current_conversation_turn,
     classify_image_exception,
     classify_upstream_message,
     classify_task_failure,
@@ -42,6 +43,7 @@ from services.image_failure import (
 from services.protocol.reasoning import normalize_thinking_effort
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
 from utils.file_names import sanitize_public_filename
+from utils.image_download_urls import validate_public_image_url, image_fetch_curl_options
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.diagnostics import diagnostic_excerpt
 from utils.log import logger
@@ -90,6 +92,10 @@ EDITABLE_FILE_PPT_PROMPT = """我需要你根据用户的需求，来制作一�
 最后只需要给我生成一个PPT文件，以及生成中遇到的各种素材压缩包zip文件就行。"""
 EDITABLE_FILE_PSD_PROMPT = "帮我生成这个图像，把这张海报分成若干图像，包括背景图，每个元素不要改位置，这样子我可以直接在 平时里无需拖动，底色为白色，不要伪透明底。再帮我将以上拆分的图像拼合成一个psd文件，去除白色底，不要改变每个图层的相应位置，保留每个元素所在图层的相应位置，保留每个元素的图层，最后只需要给我输出psd文件，以及每个图层的zip文件"
 EDITABLE_ASSET_POINTER_RE = re.compile(r"(?:file-service|sediment)://([A-Za-z0-9_-]+)")
+SANDBOX_IMAGE_RE = re.compile(
+    r"sandbox:(/mnt/data/[^\s\"'<>\)\]]+\.(?:png|jpe?g|webp|gif))(?=[\s\"'<>\)\]]|$)",
+    re.IGNORECASE,
+)
 
 HTTP_TIMING_INFOS = (
     CurlInfo.NAMELOOKUP_TIME,
@@ -242,6 +248,7 @@ class OpenAIBackendAPI:
         self._http_timings: dict[str, dict[str, Any]] = {}
         self._image_result_timing: dict[str, int] = {}
         self._closed = False
+        self.deadline_monotonic = deadline_monotonic
         explicit_proxy = str(proxy or proxy_url or "").strip()
         self.proxy_profile = proxy_profile or proxy_settings.get_profile(
             account=self.account,
@@ -2973,13 +2980,60 @@ class OpenAIBackendAPI:
         }
         return snapshot, diagnostic_excerpt(terminal_assistant_text(data), 2000)
 
+    def _resolve_sandbox_image_urls(
+            self, conversation_id: str, conversation: Dict[str, Any], *, deadline: float,
+    ) -> list[str]:
+        # Only the final assistant on the current branch may publish a group.
+        # Earlier turns, user attachments and intermediate tool files are inputs.
+        if conversation.get("current_node") not in (conversation.get("mapping") or {}):
+            return []
+        message: dict[str, Any] = {}
+        for candidate in reversed(current_conversation_turn(conversation)):
+            role = (candidate.get("author") or {}).get("role")
+            terminal = candidate.get("end_turn") is True or is_terminal_message_status(candidate.get("status"))
+            if role == "assistant" and terminal and candidate.get("recipient", "all") == "all":
+                message = dict(candidate)
+                break
+        if not message:
+            return []
+        failure = classify_upstream_message(message)
+        if failure is not None and failure.code != "upstream_text_reply":
+            return []
+        message_id = str(message.get("id") or "")
+        if not message_id:
+            return []
+        paths = list(dict.fromkeys(SANDBOX_IMAGE_RE.findall(self._editable_message_text(message))))
+        if len(paths) > config.image_max_n:
+            raise ImageDownloadError("image file group exceeds the configured image limit")
+        urls: list[str] = []
+        for raw_path in paths:
+            path = unquote(raw_path)
+            if (not path.startswith("/mnt/data/") or ".." in PurePosixPath(path).parts
+                    or "\\" in path or "%" in path or any(ord(char) < 32 for char in path)):
+                raise ImageDownloadError("invalid sandbox image path")
+            artifact = EditableFileArtifact(
+                name=PurePosixPath(path).name, sandbox_path=path,
+                message_id=message_id, author_role="assistant",
+            )
+            try:
+                url = self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline)
+            except Exception as exc:
+                failure = classify_image_exception(exc)
+                if failure.capability == "auth":
+                    raise
+                raise ImageDownloadError("could not resolve a conversation image file") from exc
+            if not url:
+                raise ImageDownloadError("conversation image file is unavailable")
+            urls.append(url)
+        return urls
+
     def _poll_image_results(
             self,
             conversation_id: str,
             timeout_secs: float = 120.0,
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
-    ) -> tuple[list[str], list[str]]:
+    ) -> tuple[list[str], list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
         - Sleeps image_poll_initial_wait_secs first (default 5s, +jitter). ChatGPT
@@ -3154,7 +3208,7 @@ class OpenAIBackendAPI:
                                 "conversation_id": conversation_id,
                                 "error": diagnostic_excerpt(recovery_exc, 300),
                             })
-                        return file_ids, sediment_ids
+                        return file_ids, sediment_ids, []
                     _raise_final_failure(
                         task_probe_failure,
                         raw_detail=str(exc),
@@ -3178,7 +3232,9 @@ class OpenAIBackendAPI:
             conversation_query_started = time.perf_counter()
             try:
                 try:
-                    conversation = self._get_conversation(conversation_id)
+                    conversation = self._get_conversation(
+                        conversation_id, timeout_secs=max(0.001, min(60.0, _remaining())),
+                    )
                 finally:
                     self._add_image_result_timing(
                         "poll_request_ms",
@@ -3221,6 +3277,19 @@ class OpenAIBackendAPI:
             conversation_transport_failure = None
             conversation_transport_error = None
             last_conversation_snapshot, last_assistant_text = self._conversation_poll_snapshot(conversation)
+
+            conversation_failure = classify_conversation_failure(conversation)
+            terminal_failure = merge_message_failure(pending_task_failure, conversation_failure)
+            if terminal_failure is None or terminal_failure.code == "upstream_text_reply":
+                resolve_started = time.perf_counter()
+                try:
+                    sandbox_urls = self._resolve_sandbox_image_urls(
+                        conversation_id, conversation, deadline=started_at + timeout_secs,
+                    )
+                finally:
+                    self._add_image_result_timing("resolve_ms", (time.perf_counter() - resolve_started) * 1000)
+                if sandbox_urls:
+                    return [], [], sandbox_urls
 
             for record in self._extract_image_tool_records(conversation):
                 for file_id in record["file_ids"]:
@@ -3271,18 +3340,18 @@ class OpenAIBackendAPI:
                     # 先check再hit 机制关闭：直接返回首次发现的 file_ids
                     logger.info({"event": "image_poll_hit_no_settle", "conversation_id": conversation_id,
                                  "file_ids": file_ids, "sediment_ids": sediment_ids})
-                    return file_ids, sediment_ids
+                    return file_ids, sediment_ids, []
                 hit_key = (tuple(file_ids), tuple(sediment_ids))
                 if last_hit_key == hit_key:
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
-                    return file_ids, sediment_ids
+                    return file_ids, sediment_ids, []
                 last_hit_key = hit_key
                 if not config.image_settle_enabled:
                     # 二次确认机制关闭：直接返回首次发现的 file_ids
                     logger.info({"event": "image_poll_hit_settle_disabled", "conversation_id": conversation_id,
                                  "file_ids": file_ids, "sediment_ids": sediment_ids})
-                    return file_ids, sediment_ids
+                    return file_ids, sediment_ids, []
                 logger.info({"event": "image_poll_hit_pending_settle", "conversation_id": conversation_id,
                              "file_ids": file_ids, "sediment_ids": sediment_ids,
                              "settle_secs": config.image_settle_secs})
@@ -3290,7 +3359,7 @@ class OpenAIBackendAPI:
                 if wait > 0:
                     self._sleep_for_image_poll(wait)
                     continue
-                return file_ids, sediment_ids
+                return file_ids, sediment_ids, []
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.monotonic() - started_at, 1)})
             wait = min(interval, max(0.0, _remaining()))
@@ -3581,6 +3650,8 @@ class OpenAIBackendAPI:
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
         timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
+        if getattr(self, "deadline_monotonic", None):
+            timeout = min(timeout, self._remaining_timeout(self.deadline_monotonic, "image request deadline exceeded"))
         # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
         # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。
         if poll and conversation_id and (file_ids or sediment_ids):
@@ -3601,7 +3672,7 @@ class OpenAIBackendAPI:
                 "poll_timeout_secs": timeout,
             })
             try:
-                polled_file_ids, polled_sediment_ids = self._poll_image_results(
+                polled_file_ids, polled_sediment_ids, sandbox_urls = self._poll_image_results(
                     conversation_id,
                     timeout,
                     file_ids,
@@ -3620,6 +3691,8 @@ class OpenAIBackendAPI:
                 if not file_ids and not sediment_ids:
                     raise
                 failure = classify_image_exception(exc)
+                if failure.scope == "delivery":
+                    raise
                 if failure.capability == "auth":
                     self._schedule_auth_recovery("image_result_probe_after_success")
                 logger.warning({
@@ -3631,36 +3704,64 @@ class OpenAIBackendAPI:
                     "error": diagnostic_excerpt(repr(exc), 300),
                 })
             else:
+                if sandbox_urls:
+                    return sandbox_urls
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
         return self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
 
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images: list[bytes] = []
-        for url in urls:
-            parsed_url = urlparse(url)
-            same_origin = (
-                not parsed_url.netloc
-                or parsed_url.netloc.lower() == urlparse(self.base_url).netloc.lower()
-            )
-            download_headers = (
-                self._headers(parsed_url.path or "/")
-                if same_origin
-                else self._signed_asset_headers()
-            )
+        total_bytes = 0
+        deadline = getattr(self, "deadline_monotonic", None) or time.monotonic() + 120
+        for url in dict.fromkeys(urls):
             for attempt in range(2):
                 try:
-                    response = self.session.get(
-                        url,
-                        headers=download_headers,
-                        timeout=120,
-                    )
-                    ensure_ok(
-                        response,
-                        "image_download",
-                        credential_scope="account" if same_origin else "signed_asset",
-                    )
-                    content = bytes(response.content or b"")
+                    current_url = url
+                    content = b""
+                    for redirect in range(4):
+                        parsed = urlparse(current_url)
+                        origin = urlparse(self.base_url)
+                        if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+                            raise ImageDownloadError("invalid image download URL")
+                        same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
+                        timeout = self._remaining_timeout(deadline, "image download deadline exceeded")
+                        if same_origin:
+                            response = self.session.get(
+                                current_url, headers=self._headers(parsed.path or "/"),
+                                timeout=min(120, timeout), allow_redirects=False, stream=True,
+                            )
+                        else:
+                            parsed, addresses = validate_public_image_url(current_url)
+                            # Signed assets carry their own authorization. Use a
+                            # separate, pinned connection with no account cookies.
+                            response = requests.get(
+                                current_url, headers={"Accept": "image/*,application/octet-stream"},
+                                timeout=min(120, self._remaining_timeout(deadline, "image download deadline exceeded")),
+                                allow_redirects=False, stream=True,
+                                curl_options=image_fetch_curl_options(parsed, addresses),
+                            )
+                        try:
+                            if 300 <= response.status_code < 400:
+                                location = response.headers.get("Location")
+                                if not location or redirect == 3:
+                                    raise ImageDownloadError("image download redirect limit exceeded")
+                                current_url = urljoin(current_url, location)
+                                continue
+                            ensure_ok(response, "image_download", credential_scope="account" if same_origin else "signed_asset")
+                            length = response.headers.get("Content-Length", "")
+                            if str(length).isdigit() and int(length) > 50 * 1024 * 1024:
+                                raise ImageDownloadError("image download exceeds 50MB limit")
+                            buffer = bytearray()
+                            for chunk in response.iter_content(chunk_size=64 * 1024):
+                                self._remaining_timeout(deadline, "image download deadline exceeded")
+                                if len(buffer) + len(chunk) > 50 * 1024 * 1024 or total_bytes + len(buffer) + len(chunk) > 100 * 1024 * 1024:
+                                    raise ImageDownloadError("image download size limit exceeded")
+                                buffer.extend(chunk)
+                            content = bytes(buffer)
+                            break
+                        finally:
+                            response.close()
                     if not content:
                         if attempt == 0:
                             logger.warning({
@@ -3670,8 +3771,17 @@ class OpenAIBackendAPI:
                             })
                             continue
                         raise ImageDownloadError("image download returned an empty response")
-                    if content not in images:
-                        images.append(content)
+                    try:
+                        with Image.open(BytesIO(content)) as image:
+                            if image.format not in {"PNG", "JPEG", "WEBP", "GIF"}:
+                                raise ValueError("unsupported image file format")
+                            image.verify()
+                        with Image.open(BytesIO(content)) as image:
+                            image.load()
+                    except Exception as exc:
+                        raise ImageDownloadError("downloaded file is not a valid image") from exc
+                    images.append(content)
+                    total_bytes += len(content)
                     break
                 except ImageDownloadError:
                     raise
@@ -3682,12 +3792,11 @@ class OpenAIBackendAPI:
                             "event": "image_download_retry",
                             "reason": failure.code,
                             "url_host": urlparse(url).netloc,
-                            "error": diagnostic_excerpt(repr(exc), 300),
                         })
                         continue
                     raise ImageDownloadError(
-                        f"image download failed: {diagnostic_excerpt(exc, 500)}",
-                        failure=failure,
+                        "image download failed",
+                        failure=failure if failure.capability == "auth" else image_failure("image_download_failed"),
                     ) from exc
         return images
 

@@ -43,7 +43,7 @@ from services.image_failure import (
 )
 from services.image_storage_service import image_media_type, image_storage_service
 from services.image_upscale_service import upscale_image_if_needed
-from services.openai_backend_api import OpenAIBackendAPI
+from services.openai_backend_api import OpenAIBackendAPI, SANDBOX_IMAGE_RE
 from services.proxy_service import ImageEgressDeadlineError, proxy_settings
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.helper import (
@@ -1844,7 +1844,7 @@ def _image_result_output_from_urls(
         backend,
         request,
         conversation_id,
-        image_urls,
+        image_urls[:request.n],
         index,
         total,
         path=path,
@@ -2087,6 +2087,13 @@ def stream_image_outputs(
                 "failure_code": stream_failure.code,
                 "error": diagnostic_excerpt(message, 1000),
             })
+
+    if (stream_failure is not None and stream_failure.code == "upstream_text_reply"
+            and conversation_id and SANDBOX_IMAGE_RE.search(message)):
+        # The stream is only a hint. Resolve files from the authenticated current
+        # conversation before treating this as a terminal text-only response.
+        stream_failure = None
+        should_poll_for_image = True
 
     if stream_failure is not None and not file_ids and not sediment_ids:
         yield ImageOutput(
@@ -2417,6 +2424,7 @@ def _generate_single_image(
             failure: ImageFailure | None = None,
             error: ImageGenerationError | None = None,
             quota_consumed: bool | None = None,
+            result_image_count: int = 0,
         ) -> None:
             nonlocal image_slot_finalized
             if image_slot_finalized:
@@ -2465,6 +2473,7 @@ def _generate_single_image(
                     else "failed"
                 ),
                 "duration_ms": max(0, int((time.perf_counter() - attempt_started) * 1000)),
+                "result_image_count": result_image_count,
             }
             if attempt_conversation_id:
                 attempt["conversation_id"] = attempt_conversation_id
@@ -2777,7 +2786,9 @@ def _generate_single_image(
                     image_attempts=image_attempts,
                 )
             _cleanup_image_conversations_after_success(backend, outputs)
-            finalize_image_slot(True)
+            finalize_image_slot(True, result_image_count=sum(
+                len(output.data) for output in outputs if output.kind == "result"
+            ))
             attach_attempts_to_outputs(outputs)
             if request.trace_image_perf:
                 result_images = image_output_metadata([
@@ -2991,8 +3002,69 @@ def _select_image_pool_error(errors: dict[int, Exception]) -> Exception | None:
     return selected
 
 
+def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageOutput]:
+    """Keep candidate singles private until a coherent result group is known."""
+    candidates: list[ImageOutput] = []
+    attempts: list[dict[str, Any]] = []
+    errors: dict[int, Exception] = {}
+    last_outputs: list[ImageOutput] = []
+    for index in range(1, request.n + 1):
+        if time.monotonic() >= request.deadline_monotonic:
+            errors[index] = ImageGenerationError(
+                "image edit exceeded the request deadline", failure=image_failure("task_interrupted"),
+            )
+            break
+        try:
+            outputs = _generate_single_image(replace(request), index, request.n)
+        except Exception as exc:
+            _capture_failed_image_attempts(request, exc)
+            errors[index] = exc
+            for attempt in getattr(exc, "image_attempts", []):
+                if attempt not in attempts:
+                    attempts.append(dict(attempt))
+            continue
+        current_attempts: list[dict[str, Any]] = []
+        for output in outputs:
+            for attempt in output.image_attempts:
+                if attempt not in current_attempts:
+                    current_attempts.append(dict(attempt))
+        delivered = sum(len(output.data) for output in outputs if output.kind == "result")
+        if delivered > 1:
+            # Prefer one conversation's group to unrelated earlier singles.
+            for attempt in attempts:
+                if attempt.get("status") == "success":
+                    attempt["result_disposition"] = "superseded"
+                    attempt["result_image_count"] = 0
+            attempts.extend(current_attempts)
+            for output in outputs:
+                yield replace(output, image_attempts=attempts)
+            return
+        attempts.extend(current_attempts)
+        if delivered:
+            candidates.extend(output for output in outputs if output.kind == "result")
+        else:
+            last_outputs = outputs
+            if not candidates and any(
+                output.failure is not None and output.failure.outcome == "text"
+                for output in outputs
+            ):
+                break
+    if candidates:
+        for output in candidates:
+            yield replace(output, image_attempts=attempts)
+        return
+    if last_outputs:
+        for output in last_outputs:
+            yield replace(output, image_attempts=attempts)
+        return
+    if selected_error := _select_image_pool_error(errors):
+        selected_error.image_attempts = attempts
+        raise selected_error
+    raise ImageGenerationError("image edit completed without output", failure=image_failure("no_image_generated"))
+
+
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
-    """并行生成多张图片，每张图片使用独立线程和账号，互不阻塞。"""
+    """Collect an edit's first result group before scheduling remaining variants."""
     normalized_output_format = normalize_image_output_format(request.output_format)
     validate_image_output_request(
         request.model,
@@ -3055,7 +3127,11 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             yield output
         return
 
-    # 多张图片：根据配置选择并行或串行执行
+    if request.images and not is_codex_image_model(request.model):
+        yield from _stream_grouped_image_edits(request)
+        return
+
+    # Generation without references and Codex retain their concurrency policy.
     if not config.image_parallel_generation:
         logger.info({
             "event": "image_serial_generation_start",
@@ -3066,7 +3142,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         errors: dict[int, Exception] = {}
         for index in range(1, request.n + 1):
             try:
-                outputs = _generate_single_image(replace(request), index, request.n)
+                outputs = _generate_single_image(replace(request, n=1), index, request.n)
             except Exception as exc:
                 _capture_failed_image_attempts(request, exc)
                 errors[index] = exc
@@ -3136,7 +3212,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
 
     try:
         for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, replace(request), index, request.n)
+            future = executor.submit(_generate_single_image, replace(request, n=1), index, request.n)
             futures[future] = index
 
         # yield 结果：按完成顺序立即输出，不再等所有图片都结束后才返回成功结果。
@@ -3265,7 +3341,7 @@ def collect_image_outputs(
             if callable(result_callback) and output.data:
                 result_callback([dict(item) for item in data])
 
-    if failed_output is not None:
+    if failed_output is not None and not data:
         failure = failed_output.failure or image_failure(
             "no_image_generated",
             raw_detail=failed_output.text,

@@ -2,21 +2,20 @@ from __future__ import annotations
 
 import base64
 import binascii
-import ipaddress
 import json
 import mimetypes
 import re
-import socket
 import threading
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
 from urllib.parse import ParseResult, unquote, unquote_to_bytes, urljoin, urlparse
 
-from curl_cffi import CurlOpt, requests
+from curl_cffi import requests
 from fastapi import HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
 
+from utils.image_download_urls import validate_public_image_url, image_fetch_curl_options
 from utils.helper import parse_image_count
 
 ImageInput = tuple[bytes, str, str]
@@ -272,62 +271,10 @@ def _filename_from_url(parsed_path: str, mime_type: str) -> str:
 
 
 def _validate_public_image_url(source: str) -> tuple[ParseResult, tuple[str, ...]]:
-    """Validate a remote image URL before every network hop.
-
-    Public image URLs are the supported contract. Resolving the hostname here
-    blocks loopback, private, link-local, multicast, and other non-routable
-    destinations that would otherwise make this endpoint an SSRF primitive.
-    Redirects are validated independently by the caller.
-    """
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
-    if parsed.username or parsed.password:
-        raise HTTPException(status_code=400, detail={"error": "image_url must not include credentials"})
     try:
-        hostname = parsed.hostname
-        port = parsed.port
+        return validate_public_image_url(source)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail={"error": "invalid image_url host"}) from exc
-    if not hostname:
-        raise HTTPException(status_code=400, detail={"error": "invalid image_url host"})
-    normalized_host = hostname.rstrip(".").lower()
-    if normalized_host in {"localhost", "localhost.localdomain"} or normalized_host.endswith(".local"):
-        raise HTTPException(status_code=400, detail={"error": "image_url host is not publicly reachable"})
-    try:
-        literal = ipaddress.ip_address(normalized_host)
-    except ValueError:
-        literal = None
-    addresses: list[str]
-    if literal is not None:
-        addresses = [str(literal)]
-    else:
-        try:
-            addresses = [item[4][0] for item in socket.getaddrinfo(normalized_host, port, type=socket.SOCK_STREAM)]
-        except OSError as exc:
-            raise HTTPException(status_code=400, detail={"error": "image_url host could not be resolved"}) from exc
-    if not addresses or any(not ipaddress.ip_address(address).is_global for address in addresses):
-        raise HTTPException(status_code=400, detail={"error": "image_url host is not publicly reachable"})
-    return parsed, tuple(dict.fromkeys(addresses))
-
-
-def _image_fetch_curl_options(parsed: ParseResult, addresses: tuple[str, ...]) -> dict[CurlOpt, object]:
-    """Pin the connection to the public addresses validated for this hop."""
-    hostname = parsed.hostname or ""
-    try:
-        ipaddress.ip_address(hostname.rstrip("."))
-    except ValueError:
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        resolved = [
-            f"{hostname}:{port}:{f'[{address}]' if ':' in address else address}"
-            for address in addresses
-        ]
-    else:
-        resolved = []
-    options: dict[CurlOpt, object] = {CurlOpt.NOPROXY: "*"}
-    if resolved:
-        options[CurlOpt.RESOLVE] = resolved
-    return options
+        raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
 
 
 def _read_response_limited(response: requests.Response) -> bytes:
@@ -387,7 +334,7 @@ def _download_image_url(url: str) -> ImageInput:
                 timeout=60,
                 allow_redirects=False,
                 stream=True,
-                curl_options=_image_fetch_curl_options(parsed, addresses),
+                curl_options=image_fetch_curl_options(parsed, addresses),
             )
         except HTTPException:
             if acquired:

@@ -111,6 +111,19 @@ terminal state. `ImageStorageService` exclusively owns Image Asset catalogue and
 storage mutations. Studio owns browser conversation presentation and polling,
 not task truth.
 
+For multi-image Conversation edits, `stream_image_outputs_with_pool` first
+collects successive executions under one deadline. Single images remain
+candidates until the result shape is known. A multi-file group is delivered
+from one conversation and supersedes earlier singles; otherwise accumulated
+single-image variants are delivered after the execution slots finish.
+`OpenAIBackendAPI` resolves final assistant sandbox images through their
+conversation and message IDs, validates downloads, and hands bytes to the
+existing image formatting/storage path. It reuses current-turn selection from
+`image_failure` and public URL/DNS validation from `utils/image_download_urls`.
+Call Record attempts carry `result_image_count` and an optional
+`result_disposition=superseded`; the backend groups their labels without
+fabricating extra attempts or counting unselected candidates as delivered.
+
 ## Call Record, live monitor, and metrics
 
 ```mermaid

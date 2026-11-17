@@ -29,6 +29,7 @@ requirements may move to `archive/` after links and this index are updated.
 
 ## Active requirements
 
+- [`0004-image-file-results.md`](0004-image-file-results.md) — conversation image files and grouped edit results (`pending-verification`).
 - [`0003-invalid-account-cleanup.md`](0003-invalid-account-cleanup.md) — manual cleanup of abnormal and unknown image quota accounts (`pending-verification`).
 - [`0002-account-memory-controls.md`](0002-account-memory-controls.md) — memory
   state filtering and single/batch controls (`pending-verification`).
