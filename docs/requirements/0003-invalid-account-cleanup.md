@@ -9,23 +9,24 @@ Status: pending-verification
 
 ## Problem and scope
 
-Administrators currently select accounts manually to delete them. Add a button beside the batch menu that previews all abnormal Upstream Accounts and all accounts whose projected image quota is unknown, including unsynchronized imports. Preview spans the entire account pool. Accounts with unlimited image quota qualify only if their status is abnormal.
+Administrators need to identify and clear invalid Upstream Accounts across pages. The Accounts list displays abnormal accounts and accounts with unknown image quota, including unsynchronized imports, as invalid. The status filter and the button beside the batch menu cover the same accounts. Accounts with unlimited image quota qualify only if their status is abnormal.
 
 ## Behavior and ownership
 
 - The account projection owns quota and status classification. `AccountService` applies those classifications to preview and deletion. The Account Repository stores the same account records as before.
 - An administrator previews the deletion count, then confirms the previewed management IDs once. The service rechecks eligibility before a single batch mutation. A concurrent storage change that conflicts with the mutation requires a fresh preview.
 - The Accounts page owns the confirmation dialog, disabled state during the operation, and list refresh. It displays a zero-result message when no accounts qualify.
-- Scheduling, automatic cleanup, account status labels, and import cleanup retain their existing rules. No schema migration or new ADR is required.
+- The management projection leaves stored account status, scheduling, automatic cleanup, and import cleanup rules intact. No schema migration or new ADR is required.
 
 ## Acceptance and verification
 
 | Acceptance criterion | Verification |
 | --- | --- |
 | Unknown and abnormal accounts qualify across pages. Known quota, rate-limited and unlimited accounts are excluded unless abnormal. | API contract tests with isolated accounts |
+| Unknown quota rows display the invalid label in both status and quota columns and appear under the invalid filter. | API contract and browser checks with isolated accounts |
 | Confirmation deletes the previewed accounts that still qualify. Storage conflicts cannot delete a concurrently recovered account. | API and storage integration tests |
 | The toolbar button shows the count, supports cancellation and refreshes the list on success. | Browser test with isolated data and desktop and mobile viewports |
 
-The Python suite passed 13 tests, including the cleanup API and repository conflict checks. The frontend build passed. Browser checks at 1440 × 900 and 390 × 844 verified the two-page preview, cancellation, confirmation, the refreshed list and the empty preview. User acceptance is pending.
+The Python suite passed 14 tests, including the cleanup API, repository conflicts and the invalid status filter. The frontend build passed. Browser checks at 1440 × 900 and 390 × 844 verified the cross-page preview, cancellation, deletion and refreshed list, plus the invalid row labels, filter and merged preview count. User acceptance is pending.
 
 Rollback restores the prior application code. Account deletion uses the existing permanent deletion behavior.

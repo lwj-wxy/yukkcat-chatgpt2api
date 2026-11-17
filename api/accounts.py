@@ -39,7 +39,13 @@ from services.account_operation_events import (
 from services.account_import_job import RemoteImportJobConflictError
 from services.account_test_service import account_test_service
 from services.account_service import account_service
-from services.account_view import account_detail, account_memory_state, account_row, account_status_category
+from services.account_view import (
+    account_detail,
+    account_list_status_category,
+    account_memory_state,
+    account_row,
+    account_status_category,
+)
 from services.config import config
 from services.cpa_service import cpa_config, cpa_import_service, list_remote_files
 from services.log_service import LoggedCall
@@ -949,7 +955,7 @@ def _status_matches_filter(account: dict[str, Any], status_filter: str) -> bool:
     if not status_filter or status_filter == "all":
         return True
     if status_filter in {"normal", "limited", "abnormal", "disabled"}:
-        return _account_status_category(account) == status_filter
+        return account_list_status_category(account, unlimited_quota=_account_unlimited_quota(account)) == status_filter
     status = _clean_text(account.get("status"))
     status_map = {
         "normal": "\u6b63\u5e38",
@@ -1641,7 +1647,7 @@ def create_router() -> APIRouter:
         abnormal_targets = [
             (token, account_id)
             for token, account_id in targets
-            if _status_matches_filter(account_service.get_account(token) or {}, "abnormal")
+            if _account_status_category(account_service.get_account(token) or {}) == "abnormal"
         ]
         labels = _account_operation_labels(abnormal_targets)
         removed_ids: list[str] = []

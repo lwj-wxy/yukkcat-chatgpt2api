@@ -21,8 +21,7 @@ const props = defineProps<{
 const quotaText = computed(() => props.account.quota_label)
 
 const quotaTone = computed(() => {
-  if (props.account.quota_state === 'exhausted') return 'danger'
-  if (props.account.quota_state === 'unknown') return 'muted'
+  if (props.account.quota_state === 'exhausted' || props.account.quota_state === 'unknown') return 'danger'
   return 'success'
 })
 </script>

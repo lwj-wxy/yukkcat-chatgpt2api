@@ -273,7 +273,7 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
 
       const confirmed = await confirmDialog.ask({
         title: '清除失效账号',
-        message: `将从全部分页永久删除 ${total} 个账号（异常 ${preview.abnormal} 个，图片额度未知 ${preview.unknown_quota} 个）。`,
+        message: `将从全部分页永久删除 ${total} 个失效账号。`,
         confirmText: '确认清除',
         cancelText: '取消',
       })
