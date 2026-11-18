@@ -34,7 +34,9 @@ than the previous parallel execution. One request-wide deadline bounds them.
 The system cannot infer that a native single image is an unwanted collage.
 If a multi-image edit has fewer stable native candidates than requested and the active branch
 still has an intermediate message, probe that conversation every two seconds
-for up to eight additional seconds before accepting the candidate. A published
+for up to eight additional seconds before accepting the candidate. When the
+current turn is executing Python and the final reply is still pending, allow
+up to 25 seconds from the initial grace check, within the same deadline. A published
 group wins immediately. The existing request and poll deadlines still apply.
 
 ## Unique owners and Interfaces

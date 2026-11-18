@@ -3144,7 +3144,7 @@ class OpenAIBackendAPI:
             (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids else None
         )
         native_settle_until = 0.0
-        final_reply_grace_until: float | None = None
+        final_reply_wait_started: float | None = None
         logger.info({
             "event": "image_poll_start",
             "conversation_id": conversation_id,
@@ -3463,10 +3463,15 @@ class OpenAIBackendAPI:
                         )
                         if message and not final_reply:
                             now = time.monotonic()
-                            if final_reply_grace_until is None:
-                                final_reply_grace_until = now + 8.0
+                            if final_reply_wait_started is None:
+                                final_reply_wait_started = now
                                 logger.info({"event": "image_poll_await_final_reply", "conversation_id": conversation_id})
-                            wait = min(2.0, final_reply_grace_until - now)
+                            processing_files = any(
+                                m.get("recipient") == "python" or (m.get("author") or {}).get("name") == "python"
+                                for m in current_conversation_turn(conversation)
+                            )
+                            grace = 25.0 if processing_files else 8.0
+                            wait = min(2.0, final_reply_wait_started + grace - now)
                             if wait > 0 and _remaining() > wait + 1.0:
                                 self._sleep_for_image_poll(wait)
                                 continue
