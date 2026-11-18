@@ -120,7 +120,11 @@ single-image variants are delivered after the execution slots finish.
 conversation and message IDs, validates downloads, and hands bytes to the
 existing image formatting/storage path. Missing file URLs are retried in the
 same conversation for at most four probes within 30 seconds and the remaining
-request/poll budget; already resolved URLs are retained. Authentication failures
+request/poll budget; already resolved URLs are retained. Link resolution uses up
+to three workers and retains reply order. Multi-file edits count healthy probe
+time toward the polling interval. Stream file hints shorten the first wait, but
+only the authenticated conversation can identify output files. An incomplete
+sandbox group is rechecked within the existing poll deadline. Authentication failures
 stop immediately. Retry sleeps count as polling wait, not URL resolution time.
 It reuses current-turn selection from
 `image_failure` and public URL/DNS validation from `utils/image_download_urls`.

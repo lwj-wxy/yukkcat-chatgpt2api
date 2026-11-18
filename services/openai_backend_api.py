@@ -2982,7 +2982,9 @@ class OpenAIBackendAPI:
 
     def _resolve_sandbox_image_urls(
             self, conversation_id: str, conversation: Dict[str, Any], *, deadline: float,
-    ) -> list[str]:
+            expected_files: int = 1,
+            group_announced: bool = False,
+    ) -> list[str] | None:
         # Only the final assistant on the current branch may publish a group.
         # Earlier turns, user attachments and intermediate tool files are inputs.
         if conversation.get("current_node") not in (conversation.get("mapping") or {}):
@@ -3002,12 +3004,11 @@ class OpenAIBackendAPI:
         message_id = str(message.get("id") or "")
         if not message_id:
             return []
-        paths = list(dict.fromkeys(SANDBOX_IMAGE_RE.findall(self._editable_message_text(message))))
+        paths = list(dict.fromkeys(unquote(p) for p in SANDBOX_IMAGE_RE.findall(self._editable_message_text(message))))
         if len(paths) > config.image_max_n:
             raise ImageDownloadError("image file group exceeds the configured image limit")
         artifacts: list[EditableFileArtifact] = []
-        for raw_path in paths:
-            path = unquote(raw_path)
+        for path in paths:
             if (not path.startswith("/mnt/data/") or ".." in PurePosixPath(path).parts
                     or "\\" in path or "%" in path or any(ord(char) < 32 for char in path)):
                 raise ImageDownloadError("invalid sandbox image path")
@@ -3017,30 +3018,45 @@ class OpenAIBackendAPI:
             ))
         if not artifacts:
             return []
+        # A single ungrouped file can still be a candidate for a variant edit.
+        required = expected_files if group_announced or len(artifacts) > 1 else 1
+        if len(artifacts) < required:
+            # A subsequent snapshot may contain the remaining links.
+            return None
         # A terminal reply may precede publication of its files. Keep the same
         # conversation/message and retry only missing URLs before regenerating.
         deadline = min(deadline, time.monotonic() + 30.0,
                        getattr(self, "deadline_monotonic", None) or deadline)
         resolved: dict[str, str] = {}
+
+        def resolve(artifact: EditableFileArtifact) -> str:
+            if time.monotonic() >= deadline:
+                return ""
+            try:
+                return self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline)
+            except Exception as exc:
+                failure = classify_image_exception(exc)
+                if failure.capability == "auth":
+                    raise
+                if not failure.retryable:
+                    raise ImageDownloadError("could not resolve a conversation image file") from exc
+                return ""
+
         for probe in range(4):
-            for artifact in artifacts:
-                if artifact.sandbox_path in resolved:
-                    continue
-                if time.monotonic() >= deadline:
-                    break
-                try:
-                    url = self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline)
-                except Exception as exc:
-                    failure = classify_image_exception(exc)
-                    if failure.capability == "auth":
-                        raise
-                    if not failure.retryable:
-                        raise ImageDownloadError("could not resolve a conversation image file") from exc
-                    url = ""
+            pending = [a for a in artifacts if a.sandbox_path not in resolved]
+            if len(pending) == 1:
+                urls = [resolve(pending[0])]
+            else:
+                with ThreadPoolExecutor(max_workers=min(3, len(pending))) as pool:
+                    urls = list(pool.map(resolve, pending))
+            for artifact, url in zip(pending, urls):
                 if url:
                     resolved[artifact.sandbox_path] = url
             if len(resolved) == len(artifacts):
-                return [resolved[artifact.sandbox_path] for artifact in artifacts]
+                ordered = list(dict.fromkeys(resolved[a.sandbox_path] for a in artifacts))
+                if len(ordered) < required:
+                    raise ImageDownloadError("conversation did not publish enough distinct image files")
+                return ordered
             remaining = deadline - time.monotonic()
             if probe == 3 or remaining <= 0:
                 break
@@ -3061,6 +3077,8 @@ class OpenAIBackendAPI:
             timeout_secs: float = 120.0,
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
+            expected_files: int = 1,
+            announced_files: int = 0,
     ) -> tuple[list[str], list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
@@ -3078,6 +3096,8 @@ class OpenAIBackendAPI:
         attempt = 0
         interval = float(config.image_poll_interval_secs)
         initial_wait = float(config.image_poll_initial_wait_secs)
+        if announced_files:
+            initial_wait = min(initial_wait, 1.0)
         file_ids: list[str] = []
         sediment_ids: list[str] = []
         self._add_unique(file_ids, initial_file_ids or [])
@@ -3133,6 +3153,7 @@ class OpenAIBackendAPI:
             return True
 
         last_task_error = ""
+        pending_file_group = False
         pending_task_failure: ImageFailure | None = None
         task_probe_failure: ImageFailure | None = None
         task_probe_error: Exception | None = None
@@ -3176,12 +3197,13 @@ class OpenAIBackendAPI:
             raise exc
 
         while _remaining() > 0:
+            probe_started = time.monotonic()
             attempt += 1
             task_count = 0
             task_check_ok = False
             task_query_started = time.perf_counter()
             try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
+                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=min(5.0, max(0.001, _remaining())))
                 task_count = len(tasks)
                 task_check_ok = True
                 task_probe_failure = None
@@ -3314,6 +3336,8 @@ class OpenAIBackendAPI:
                 try:
                     sandbox_urls = self._resolve_sandbox_image_urls(
                         conversation_id, conversation, deadline=started_at + timeout_secs,
+                        expected_files=expected_files,
+                        group_announced=pending_file_group or announced_files > 1,
                     )
                 finally:
                     retry_wait = self._image_result_timing.get("poll_wait_ms", 0) - wait_before
@@ -3322,6 +3346,13 @@ class OpenAIBackendAPI:
                     )
                 if sandbox_urls:
                     return [], [], sandbox_urls
+                pending_file_group = pending_file_group or sandbox_urls is None
+                if pending_file_group:
+                    remaining = _remaining()
+                    if remaining <= 0:
+                        break
+                    self._sleep_for_image_poll(min(interval, remaining))
+                    continue
 
             for record in self._extract_image_tool_records(conversation):
                 for file_id in record["file_ids"]:
@@ -3394,9 +3425,15 @@ class OpenAIBackendAPI:
                 return file_ids, sediment_ids, []
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.monotonic() - started_at, 1)})
-            wait = min(interval, max(0.0, _remaining()))
+            # For multi-file edits, measure the polling interval between probe
+            # starts. A slow healthy query already consumed part of the interval.
+            probe_time = time.monotonic() - probe_started if expected_files > 1 and task_check_ok else 0.0
+            wait = min(max(0.0, interval - probe_time), max(0.0, _remaining()))
             if wait > 0:
                 self._sleep_for_image_poll(wait)
+        if pending_file_group and not (pending_task_failure or task_probe_failure or conversation_transport_failure):
+            _raise_final_failure(image_failure("image_download_failed"),
+                                 raw_detail=f"conversation did not publish all {expected_files} image files before timeout")
         timeout_failure = image_failure("image_poll_timeout")
         final_failure = merge_message_failure(pending_task_failure, task_probe_failure)
         final_failure = merge_message_failure(final_failure, conversation_transport_failure)
@@ -3677,6 +3714,8 @@ class OpenAIBackendAPI:
             sediment_ids: list[str],
             poll: bool = True,
             poll_timeout_secs: float | None = None,
+            expected_files: int = 1,
+            announced_files: int = 0,
     ) -> list[str]:
         self._reset_image_result_timing()
         file_ids = [item for item in file_ids if item != "file_upload"]
@@ -3709,6 +3748,8 @@ class OpenAIBackendAPI:
                     timeout,
                     file_ids,
                     sediment_ids,
+                    expected_files=expected_files,
+                    announced_files=announced_files,
                 )
             except ImagePollTimeoutError as exc:
                 if not file_ids and not sediment_ids:

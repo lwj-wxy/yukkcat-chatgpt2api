@@ -2126,6 +2126,8 @@ def stream_image_outputs(
         file_ids,
         sediment_ids,
         poll_timeout_secs=config.image_poll_timeout_secs,
+        expected_files=request.n if request.images else 1,
+        announced_files=len(set(SANDBOX_IMAGE_RE.findall(message))) if is_text_reply else 0,
         index=index,
         total=total,
     )
