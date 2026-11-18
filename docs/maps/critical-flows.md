@@ -119,7 +119,7 @@ single-image variants are delivered after the execution slots finish.
 `OpenAIBackendAPI` resolves final assistant sandbox images through their
 conversation and message IDs, validates downloads, and hands bytes to the
 existing image formatting/storage path. Missing file URLs are retried in the
-same conversation for at most four probes within 30 seconds and the remaining
+same conversation for at most five multi-file probes (four for a single file) within 30 seconds and the remaining
 request/poll budget; already resolved URLs are retained. Link resolution uses up
 to three workers and retains reply order. Multi-file edits count healthy probe
 time toward the polling interval. Stream file hints shorten the first wait, but

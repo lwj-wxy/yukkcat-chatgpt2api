@@ -3029,27 +3029,28 @@ class OpenAIBackendAPI:
                        getattr(self, "deadline_monotonic", None) or deadline)
         resolved: dict[str, str] = {}
 
-        def resolve(artifact: EditableFileArtifact) -> str:
+        def resolve(artifact: EditableFileArtifact) -> tuple[str, float]:
             if time.monotonic() >= deadline:
-                return ""
+                return "", 0.0
             try:
-                return self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline)
+                return self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline), 0.0
             except Exception as exc:
                 failure = classify_image_exception(exc)
                 if failure.capability == "auth":
                     raise
                 if not failure.retryable:
                     raise ImageDownloadError("could not resolve a conversation image file") from exc
-                return ""
+                return "", float(failure.retry_after or 0)
 
-        for probe in range(4):
+        delays = (1, 2, 4, 7) if required > 1 else (2, 4, 8)
+        for probe in range(len(delays) + 1):
             pending = [a for a in artifacts if a.sandbox_path not in resolved]
             if len(pending) == 1:
                 urls = [resolve(pending[0])]
             else:
                 with ThreadPoolExecutor(max_workers=min(3, len(pending))) as pool:
                     urls = list(pool.map(resolve, pending))
-            for artifact, url in zip(pending, urls):
+            for artifact, (url, _) in zip(pending, urls):
                 if url:
                     resolved[artifact.sandbox_path] = url
             if len(resolved) == len(artifacts):
@@ -3058,9 +3059,10 @@ class OpenAIBackendAPI:
                     raise ImageDownloadError("conversation did not publish enough distinct image files")
                 return ordered
             remaining = deadline - time.monotonic()
-            if probe == 3 or remaining <= 0:
+            if probe == len(delays) or remaining <= 0:
                 break
-            wait = min(2.0 ** (probe + 1), remaining)
+            retry_after = max(delay for _, delay in urls)
+            wait = min(max(delays[probe], retry_after), remaining)
             logger.info({
                 "event": "image_file_resolution_retry", "conversation_id": conversation_id,
                 "attempt": probe + 1, "pending_count": len(artifacts) - len(resolved),
@@ -3106,6 +3108,7 @@ class OpenAIBackendAPI:
         last_hit_key: tuple[tuple[str, ...], tuple[str, ...]] | None = (
             (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids else None
         )
+        native_settle_until = 0.0
         logger.info({
             "event": "image_poll_start",
             "conversation_id": conversation_id,
@@ -3332,12 +3335,13 @@ class OpenAIBackendAPI:
             terminal_failure = merge_message_failure(pending_task_failure, conversation_failure)
             if terminal_failure is None or terminal_failure.code == "upstream_text_reply":
                 resolve_started = time.perf_counter()
+                early_settle_probe = time.monotonic() < native_settle_until
                 wait_before = self._image_result_timing.get("poll_wait_ms", 0)
                 try:
                     sandbox_urls = self._resolve_sandbox_image_urls(
                         conversation_id, conversation, deadline=started_at + timeout_secs,
                         expected_files=expected_files,
-                        group_announced=pending_file_group or announced_files > 1,
+                        group_announced=pending_file_group or announced_files > 1 or early_settle_probe,
                     )
                 finally:
                     retry_wait = self._image_result_timing.get("poll_wait_ms", 0) - wait_before
@@ -3346,12 +3350,12 @@ class OpenAIBackendAPI:
                     )
                 if sandbox_urls:
                     return [], [], sandbox_urls
-                pending_file_group = pending_file_group or sandbox_urls is None
+                pending_file_group = pending_file_group or (sandbox_urls is None and not early_settle_probe)
                 if pending_file_group:
                     remaining = _remaining()
                     if remaining <= 0:
                         break
-                    self._sleep_for_image_poll(min(interval, remaining))
+                    self._sleep_for_image_poll(min(interval, 2.0, remaining))
                     continue
 
             for record in self._extract_image_tool_records(conversation):
@@ -3406,6 +3410,10 @@ class OpenAIBackendAPI:
                     return file_ids, sediment_ids, []
                 hit_key = (tuple(file_ids), tuple(sediment_ids))
                 if last_hit_key == hit_key:
+                    remaining_settle = native_settle_until - time.monotonic()
+                    if remaining_settle > 0:
+                        self._sleep_for_image_poll(min(remaining_settle, max(0.0, _remaining())))
+                        continue
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids, []
@@ -3419,6 +3427,11 @@ class OpenAIBackendAPI:
                              "file_ids": file_ids, "sediment_ids": sediment_ids,
                              "settle_secs": config.image_settle_secs})
                 wait = min(config.image_settle_secs, max(0.0, _remaining()))
+                if expected_files > 1 and wait > 2.0:
+                    # Check for a complete final reply during native-ID settling.
+                    # The early probe cannot publish an unchanged native candidate.
+                    native_settle_until = time.monotonic() + wait
+                    wait = 2.0
                 if wait > 0:
                     self._sleep_for_image_poll(wait)
                     continue

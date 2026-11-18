@@ -52,7 +52,7 @@ images. User attachments, other branches, previous turns, arbitrary text URLs,
 and intermediate tool files do not qualify. Explicit policy failures remain
 failures. File resolution is bound to conversation ID and message ID. Missing
 files and invalid image bodies are delivery failures, not invalid accounts.
-Temporarily missing URLs receive up to four same-conversation probes, retaining
+Temporarily missing URLs receive up to five same-conversation probes for a group (four for a single file), retaining
 resolved URLs, within 30 seconds and the remaining request/poll deadline.
 Authentication failures stop immediately. Log normalization preserves delivered
 counts and superseded dispositions; retry sleep is counted only as polling wait.
