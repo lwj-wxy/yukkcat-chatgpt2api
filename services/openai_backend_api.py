@@ -184,6 +184,14 @@ def _response_http_timing(response: Any) -> dict[str, Any]:
     return timing
 
 
+def _capture_url_response(probe: dict | None, response: Any) -> None:
+    if probe is not None:
+        timing = _response_http_timing(response)
+        for key in ("http_status", "http_dns_ms", "http_tcp_ms", "http_tls_ms", "http_wait_ms", "http_ttfb_ms"):
+            if key in timing:
+                probe[key] = timing[key]
+
+
 @dataclass
 class EditableFileArtifact:
     attachment_id: str = ""
@@ -246,7 +254,7 @@ class OpenAIBackendAPI:
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
         self._http_timings: dict[str, dict[str, Any]] = {}
-        self._image_result_timing: dict[str, int] = {}
+        self._reset_image_result_timing()
         self._closed = False
         self.deadline_monotonic = deadline_monotonic
         explicit_proxy = str(proxy or proxy_url or "").strip()
@@ -412,6 +420,23 @@ class OpenAIBackendAPI:
 
     def _reset_image_result_timing(self) -> None:
         self._image_result_timing = {}
+        self._file_url_probes: list[dict[str, Any]] = []
+
+    def pop_file_url_probes(self) -> list[dict]:
+        probes = sorted(getattr(self, "_file_url_probes", ()), key=lambda p: (p["image"], p["round"]))
+        self._file_url_probes = []
+        return probes
+
+    def _timed_file_url(self, index: int, round_number: int, source: str, lookup: Callable[[dict], str]) -> str:
+        probe = {"image": index, "round": round_number, "source": source, "result": "error"}
+        started = time.perf_counter()
+        try:
+            url = lookup(probe)
+            probe["result"] = "ready" if url else "pending"
+            return url
+        finally:
+            probe["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
+            self._file_url_probes.append(probe)
 
     def _add_image_result_timing(self, key: str, milliseconds: float) -> None:
         if not key:
@@ -2181,6 +2206,7 @@ class OpenAIBackendAPI:
             artifact: EditableFileArtifact,
             *,
             deadline: float | None = None,
+            probe: dict | None = None,
     ) -> str:
         ids: list[str] = []
         for item in (artifact.attachment_id, artifact.file_id):
@@ -2194,6 +2220,7 @@ class OpenAIBackendAPI:
                 params={"message_id": artifact.message_id, "sandbox_path": artifact.sandbox_path},
                 timeout=self._editable_request_timeout(deadline, 60),
             )
+            _capture_url_response(probe, response)
             if url := self._editable_download_url_candidate(response, path):
                 return url
         for attachment_id in ids:
@@ -3028,12 +3055,17 @@ class OpenAIBackendAPI:
         deadline = min(deadline, time.monotonic() + 30.0,
                        getattr(self, "deadline_monotonic", None) or deadline)
         resolved: dict[str, str] = {}
+        indices = {a.sandbox_path: i for i, a in enumerate(artifacts, 1)}
 
         def resolve(artifact: EditableFileArtifact) -> tuple[str, float]:
             if time.monotonic() >= deadline:
                 return "", 0.0
             try:
-                return self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline), 0.0
+                url = self._timed_file_url(
+                    indices[artifact.sandbox_path], probe + 1, "sandbox",
+                    lambda sample: self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline, probe=sample),
+                )
+                return url, 0.0
             except Exception as exc:
                 failure = classify_image_exception(exc)
                 if failure.capability == "auth":
@@ -3043,32 +3075,35 @@ class OpenAIBackendAPI:
                 return "", float(failure.retry_after or 0)
 
         delays = (1, 2, 4, 7) if required > 1 else (2, 4, 8)
-        for probe in range(len(delays) + 1):
-            pending = [a for a in artifacts if a.sandbox_path not in resolved]
-            if len(pending) == 1:
-                urls = [resolve(pending[0])]
-            else:
-                with ThreadPoolExecutor(max_workers=min(3, len(pending))) as pool:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            for probe in range(len(delays) + 1):
+                pending = [a for a in artifacts if a.sandbox_path not in resolved]
+                if len(pending) <= 3:
+                    # curl_cffi reuses connections per thread. Keep one lookup on
+                    # the polling thread and keep worker connections across retries.
+                    futures = [pool.submit(resolve, a) for a in pending[1:]]
+                    urls = [resolve(pending[0]), *(future.result() for future in futures)]
+                else:
                     urls = list(pool.map(resolve, pending))
-            for artifact, (url, _) in zip(pending, urls):
-                if url:
-                    resolved[artifact.sandbox_path] = url
-            if len(resolved) == len(artifacts):
-                ordered = list(dict.fromkeys(resolved[a.sandbox_path] for a in artifacts))
-                if len(ordered) < required:
-                    raise ImageDownloadError("conversation did not publish enough distinct image files")
-                return ordered
-            remaining = deadline - time.monotonic()
-            if probe == len(delays) or remaining <= 0:
-                break
-            retry_after = max(delay for _, delay in urls)
-            wait = min(max(delays[probe], retry_after), remaining)
-            logger.info({
-                "event": "image_file_resolution_retry", "conversation_id": conversation_id,
-                "attempt": probe + 1, "pending_count": len(artifacts) - len(resolved),
-                "sleep_secs": round(wait, 3),
-            })
-            self._sleep_for_image_poll(wait)
+                for artifact, (url, _) in zip(pending, urls):
+                    if url:
+                        resolved[artifact.sandbox_path] = url
+                if len(resolved) == len(artifacts):
+                    ordered = list(dict.fromkeys(resolved[a.sandbox_path] for a in artifacts))
+                    if len(ordered) < required:
+                        raise ImageDownloadError("conversation did not publish enough distinct image files")
+                    return ordered
+                remaining = deadline - time.monotonic()
+                if probe == len(delays) or remaining <= 0:
+                    break
+                retry_after = max(delay for _, delay in urls)
+                wait = min(max(delays[probe], retry_after), remaining)
+                logger.info({
+                    "event": "image_file_resolution_retry", "conversation_id": conversation_id,
+                    "attempt": probe + 1, "pending_count": len(artifacts) - len(resolved),
+                    "sleep_secs": round(wait, 3),
+                })
+                self._sleep_for_image_poll(wait)
         error = ImageDownloadError("conversation image file is unavailable after bounded retries")
         error.conversation_id = conversation_id
         raise error
@@ -3519,20 +3554,22 @@ class OpenAIBackendAPI:
             raw_upstream_message=last_assistant_text,
         )
 
-    def _get_file_download_url(self, file_id: str) -> str:
+    def _get_file_download_url(self, file_id: str, *, probe: dict | None = None) -> str:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=60)
+        _capture_url_response(probe, response)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
+    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str, *, probe: dict | None = None) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=60)
+        _capture_url_response(probe, response)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -3602,15 +3639,18 @@ class OpenAIBackendAPI:
         urls: list[str] = []
         resolution_errors: list[tuple[ImageFailure, Exception]] = []
         skip_patterns = {"file_upload"}
+        candidate_index = 0
 
         def resolve_candidate(
                 source: str,
                 asset_id: str,
-                resolver: Callable[[], str],
+                resolver: Callable[[dict], str],
         ) -> str:
+            nonlocal candidate_index
+            candidate_index += 1
             for attempt in range(2):
                 try:
-                    url = str(resolver() or "").strip()
+                    url = str(self._timed_file_url(candidate_index, attempt + 1, source, resolver) or "").strip()
                 except Exception as exc:
                     failure = classify_image_exception(exc)
                     missing_candidate = (
@@ -3683,7 +3723,7 @@ class OpenAIBackendAPI:
             url = resolve_candidate(
                 "file",
                 file_id,
-                lambda file_id=file_id: self._get_file_download_url(file_id),
+                lambda probe: self._get_file_download_url(file_id, probe=probe),
             )
             if url:
                 if url not in urls:
@@ -3693,9 +3733,10 @@ class OpenAIBackendAPI:
                 url = resolve_candidate(
                     "sediment",
                     sediment_id,
-                    lambda sediment_id=sediment_id: self._get_attachment_download_url(
+                    lambda probe: self._get_attachment_download_url(
                         conversation_id,
                         sediment_id,
+                        probe=probe,
                     ),
                 )
                 if url and url not in urls:

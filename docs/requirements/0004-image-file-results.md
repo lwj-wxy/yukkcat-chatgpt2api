@@ -61,6 +61,11 @@ Temporarily missing URLs receive up to five same-conversation probes for a group
 resolved URLs, within 30 seconds and the remaining request/poll deadline.
 Authentication failures stop immediately. Log normalization preserves delivered
 counts and superseded dispositions; retry sleep is counted only as polling wait.
+Each file URL lookup records its candidate index, probe round, elapsed time,
+result and available HTTP timings on the attempt's resolve event. Concurrent
+lookups overlap. Their durations are diagnostic and are not added to the
+group's wall time. Up to three sandbox lookups run concurrently, reusing the
+polling thread's connection and keeping worker threads across readiness retries.
 Public asset downloads use public DNS address pinning, no account credentials,
 bounded redirects, timeouts and byte limits. Valid results survive another
 variant's text-only failure. Existing account slot cleanup remains authoritative.

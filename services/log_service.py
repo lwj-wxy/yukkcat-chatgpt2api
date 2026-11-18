@@ -201,7 +201,15 @@ def _normalize_image_attempt_monitor(value: object) -> dict[str, object] | None:
                 continue
             event: dict[str, object] = {}
             for key, item in raw_event.items():
-                if str(key).endswith("_ms"):
+                if key == "file_url_probes" and isinstance(item, list):
+                    event[key] = [
+                        {k: v for k, v in probe.items() if k in {
+                            "image", "round", "source", "result", "elapsed_ms", "http_status",
+                            "http_dns_ms", "http_tcp_ms", "http_tls_ms", "http_wait_ms", "http_ttfb_ms",
+                        }}
+                        for probe in item if isinstance(probe, dict)
+                    ]
+                elif str(key).endswith("_ms"):
                     try:
                         parsed = max(0, int(item))
                     except (TypeError, ValueError):

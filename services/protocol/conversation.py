@@ -176,7 +176,7 @@ def _backend_http_timing_data(backend: OpenAIBackendAPI | None, name: str = "ima
 def _backend_image_result_timing_data(
         backend: OpenAIBackendAPI | None,
         fallback_resolve_ms: int,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     if backend is not None and hasattr(backend, "pop_image_result_timing"):
         try:
             timing = backend.pop_image_result_timing()
@@ -188,8 +188,11 @@ def _backend_image_result_timing_data(
                 for key, value in timing.items()
                 if str(key).endswith("_ms") and int(value or 0) > 0
             }
-            if normalized:
-                return normalized
+            if not normalized:
+                normalized["resolve_ms"] = max(0, int(fallback_resolve_ms))
+            if hasattr(backend, "pop_file_url_probes") and (probes := backend.pop_file_url_probes()):
+                return {**normalized, "file_url_probes": probes}
+            return normalized
     return {"resolve_ms": max(0, int(fallback_resolve_ms))}
 
 
