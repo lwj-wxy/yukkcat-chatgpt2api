@@ -685,6 +685,7 @@ class ConversationRequest:
     call_id: str = ""
     trace_image_perf: bool = False
     monitor_attempt: int = 0
+    file_ready: Callable[[int, str], None] | None = None
     deadline_monotonic: float = 0.0
 
 
@@ -1841,6 +1842,14 @@ def _image_result_output_from_urls(
 ) -> ImageOutput | None:
     if not image_urls:
         return None
+    if request.response_format == "upstream_url":
+        from services.protocol.direct_image_stream import asset_identity
+        distinct = {}
+        for url in image_urls:
+            distinct.setdefault(asset_identity(url), url)
+        return ImageOutput("result", request.model, index, total,
+                           data=[{"url": url} for url in list(distinct.values())[:request.n]],
+                           conversation_id=conversation_id)
     if request.progress_callback:
         request.progress_callback("receiving_image")
     downloaded_images = _download_image_bytes_with_monitor(
@@ -2630,6 +2639,11 @@ def _generate_single_image(
                 reserve_image_egress=fallback_profile is None,
                 deadline_monotonic=request.deadline_monotonic or None,
             )
+            # A text-to-image worker owns one slot. Its local file index starts at zero.
+            if request.file_ready and not request.images:
+                backend.image_file_ready = lambda _, url: request.file_ready(index - 1, url)
+            else:
+                backend.image_file_ready = request.file_ready
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)
                 if using_fallback_profile:
@@ -2796,7 +2810,8 @@ def _generate_single_image(
                     conversation_id=attempt_conversation_id,
                     image_attempts=image_attempts,
                 )
-            _cleanup_image_conversations_after_success(backend, outputs)
+            if request.response_format != "upstream_url":
+                _cleanup_image_conversations_after_success(backend, outputs)
             finalize_image_slot(True, result_image_count=sum(
                 len(output.data) for output in outputs if output.kind == "result"
             ))

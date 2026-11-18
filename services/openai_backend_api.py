@@ -3065,6 +3065,11 @@ class OpenAIBackendAPI:
                     indices[artifact.sandbox_path], probe + 1, "sandbox",
                     lambda sample: self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline, probe=sample),
                 )
+                # Only a complete terminal manifest fixes the meaning of each slot.
+                publish = getattr(self, "image_file_ready", None)
+                index = indices[artifact.sandbox_path]
+                if url and publish and len(artifacts) >= expected_files and index <= expected_files:
+                    publish(index - 1, url)
                 return url, 0.0
             except Exception as exc:
                 failure = classify_image_exception(exc)

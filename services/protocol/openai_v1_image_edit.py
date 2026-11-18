@@ -6,6 +6,7 @@ from typing import Any, Iterator
 from PIL import Image
 
 from services.image_failure import image_failure
+from services.protocol.direct_image_stream import direct_stream
 from services.protocol.conversation import (
     ConversationRequest,
     ImageGenerationError,
@@ -79,7 +80,7 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
             "image is required",
             failure=image_failure("invalid_image_input"),
         )
-    outputs = stream_image_outputs_with_pool(ConversationRequest(
+    request = ConversationRequest(
         prompt=prompt,
         model=model,
         n=n,
@@ -95,7 +96,10 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         progress_callback=progress_callback,
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
-    ))
+    )
+    if response_format == "upstream_url":
+        return direct_stream(request, bool(body.get("stream")), stream_image_outputs_with_pool)
+    outputs = stream_image_outputs_with_pool(request)
     if body.get("stream"):
         input_text_tokens = count_text_tokens(prompt, model)
         input_image_tokens = count_image_inputs_tokens(images, model)
