@@ -3109,6 +3109,7 @@ class OpenAIBackendAPI:
             (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids else None
         )
         native_settle_until = 0.0
+        final_reply_grace_until: float | None = None
         logger.info({
             "event": "image_poll_start",
             "conversation_id": conversation_id,
@@ -3414,6 +3415,26 @@ class OpenAIBackendAPI:
                     if remaining_settle > 0:
                         self._sleep_for_image_poll(min(remaining_settle, max(0.0, _remaining())))
                         continue
+                    # A native preview can stabilize before the assistant publishes
+                    # its edited files. Check the active branch before regenerating.
+                    if terminal_failure is None and expected_files > 1 and max(len(file_ids), len(sediment_ids)) == 1:
+                        node = (conversation.get("mapping") or {}).get(conversation.get("current_node")) or {}
+                        message = node.get("message") or {}
+                        final_reply = (
+                            (message.get("author") or {}).get("role") == "assistant"
+                            and message.get("recipient", "all") == "all"
+                            and (message.get("content") or {}).get("content_type") == "text"
+                            and (message.get("end_turn") is True or is_terminal_message_status(message.get("status")))
+                        )
+                        if message and not final_reply:
+                            now = time.monotonic()
+                            if final_reply_grace_until is None:
+                                final_reply_grace_until = now + 8.0
+                                logger.info({"event": "image_poll_await_final_reply", "conversation_id": conversation_id})
+                            wait = min(2.0, final_reply_grace_until - now)
+                            if wait > 0 and _remaining() > wait + 1.0:
+                                self._sleep_for_image_poll(wait)
+                                continue
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
                     return file_ids, sediment_ids, []

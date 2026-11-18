@@ -29,6 +29,10 @@ Generation without references and Codex/SVG paths retain their scheduling.
 Single-result edits execute successive variants serially and can take longer
 than the previous parallel execution. One request-wide deadline bounds them.
 The system cannot infer that a native single image is an unwanted collage.
+If a multi-image edit has one stable native candidate and the active branch
+still has an intermediate message, probe that conversation every two seconds
+for up to eight additional seconds before accepting the candidate. A published
+group wins immediately. The existing request and poll deadlines still apply.
 
 ## Unique owners and Interfaces
 
