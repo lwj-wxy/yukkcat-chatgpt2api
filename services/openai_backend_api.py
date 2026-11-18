@@ -93,7 +93,7 @@ EDITABLE_FILE_PPT_PROMPT = """我需要你根据用户的需求，来制作一�
 EDITABLE_FILE_PSD_PROMPT = "帮我生成这个图像，把这张海报分成若干图像，包括背景图，每个元素不要改位置，这样子我可以直接在 平时里无需拖动，底色为白色，不要伪透明底。再帮我将以上拆分的图像拼合成一个psd文件，去除白色底，不要改变每个图层的相应位置，保留每个元素所在图层的相应位置，保留每个元素的图层，最后只需要给我输出psd文件，以及每个图层的zip文件"
 EDITABLE_ASSET_POINTER_RE = re.compile(r"(?:file-service|sediment)://([A-Za-z0-9_-]+)")
 SANDBOX_IMAGE_RE = re.compile(
-    r"sandbox:(/mnt/data/[^\s\"'<>\)\]]+\.(?:png|jpe?g|webp|gif))(?=[\s\"'<>\)\]]|$)",
+    r"(?:sandbox:|(?<=\]\())(/mnt/data/[^\s\"'<>\)\]]+\.(?:png|jpe?g|webp|gif))(?=[\s\"'<>\)\]]|$)",
     re.IGNORECASE,
 )
 

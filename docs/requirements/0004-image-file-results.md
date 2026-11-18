@@ -52,7 +52,8 @@ No persistent schema changes and no new dependencies are required.
 ## Failure and security behavior
 
 Only the latest terminal assistant of the current turn may publish sandbox
-images. User attachments, other branches, previous turns, arbitrary text URLs,
+images. Markdown links to `/mnt/data/` use the same conversation-bound resolver
+as `sandbox:/mnt/data/` links. User attachments, other branches, previous turns, arbitrary text URLs,
 and intermediate tool files do not qualify. Explicit policy failures remain
 failures. File resolution is bound to conversation ID and message ID. Missing
 files and invalid image bodies are delivery failures, not invalid accounts.
