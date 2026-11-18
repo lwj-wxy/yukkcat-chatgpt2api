@@ -24,6 +24,7 @@ from services.account_service import account_service
 from services.config import config
 from services.editable_file_failure import EditableFileFailureError
 from services.image_failure import (
+    HumanVerificationRequiredError,
     ImageDownloadError,
     ImageFailure,
     ImageFailureError,
@@ -211,6 +212,21 @@ class EditableFileExportResult:
     zip_path: Path
 
 
+class _DeadlineSession(requests.Session):
+    """Limit each HTTP call, including streamed reads, to the remaining budget."""
+
+    def __init__(self, deadline, **kwargs):
+        super().__init__(**kwargs)
+        self.deadline = deadline
+
+    def request(self, method, url, **kwargs):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("conversation deadline exceeded")
+        self.curl_options[CurlOpt.TIMEOUT_MS] = max(1, int(remaining * 1000))
+        return super().request(method, url, **kwargs)
+
+
 class OpenAIBackendAPI:
     """ChatGPT Web 后端封装。
 
@@ -231,6 +247,7 @@ class OpenAIBackendAPI:
             proxy: str = "",
             proxy_url: str | None = None,
             deadline_monotonic: float | None = None,
+            limit_http_to_deadline: bool = False,
     ) -> None:
         """初始化后端客户端。
 
@@ -266,12 +283,16 @@ class OpenAIBackendAPI:
             deadline_monotonic=deadline_monotonic,
         )
         try:
-            self.session = requests.Session(**proxy_settings.build_session_kwargs_from_profile(
+            session_kwargs = proxy_settings.build_session_kwargs_from_profile(
                 self.proxy_profile,
                 impersonate=self.fp["impersonate"],
                 verify=True,
                 curl_infos=list(HTTP_TIMING_INFOS),
-            ))
+            )
+            if limit_http_to_deadline and deadline_monotonic is not None:
+                self.session = _DeadlineSession(deadline_monotonic, **session_kwargs)
+            else:
+                self.session = requests.Session(**session_kwargs)
         except Exception:
             if bool(getattr(self.proxy_profile, "image_egress_reserved", False)):
                 proxy_settings.release_image_egress(self.proxy_profile)
@@ -386,9 +407,30 @@ class OpenAIBackendAPI:
                 "error": diagnostic_excerpt(exc, 500),
             })
 
+    def _mark_verification_required(self, event: str, error: str = "") -> None:
+        if not self._credential_access_token:
+            return
+        try:
+            account_service.mark_verification_required(
+                self._credential_access_token,
+                event,
+                error=error,
+                expected_access_token=self._credential_access_token,
+                expected_refresh_token=self._credential_refresh_token,
+                expected_last_token_refresh_at=self._credential_last_token_refresh_at,
+            )
+        except Exception as exc:
+            logger.warning({
+                "event": "verification_required_mark_failed",
+                "source": event,
+                "error": diagnostic_excerpt(exc, 500),
+            })
+
     def _raise_editable_failure(self, failure: ImageFailure, event: str) -> None:
         if failure.code == "auth_invalid":
             self._schedule_auth_recovery(event)
+        elif failure.code == "verification_required":
+            self._mark_verification_required(event, str(failure.raw_detail or ""))
         raise EditableFileFailureError(failure=failure)
 
     def _raise_editable_http_failure(
@@ -792,10 +834,33 @@ class OpenAIBackendAPI:
             "Upgrade-Insecure-Requests": "1",
         }
 
+    @staticmethod
+    def _resolve_turnstile_requirement(turnstile_info: Dict[str, Any], source_p: str) -> str:
+        if not turnstile_info.get("required"):
+            return ""
+        dx = turnstile_info.get("dx")
+        if not dx:
+            raise HumanVerificationRequiredError(
+                "chat requirements requires interactive turnstile verification"
+            )
+        try:
+            token = solve_turnstile_token(dx, source_p) or ""
+        except Exception as exc:
+            raise HumanVerificationRequiredError(
+                f"chat requirements turnstile verification failed: {exc}"
+            ) from exc
+        if not token:
+            raise HumanVerificationRequiredError(
+                "chat requirements turnstile verification could not be completed"
+            )
+        return token
+
     def _build_requirements(self, data: Dict[str, Any], source_p: str = "") -> ChatRequirements:
         """把 sentinel 响应整理成后续对话需要的 token 集合。"""
         if (data.get("arkose") or {}).get("required"):
-            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
+            raise HumanVerificationRequiredError(
+                "chat requirements requires arkose token, which is not implemented"
+            )
 
         proof_token = ""
         proof_info = data.get("proofofwork") or {}
@@ -808,10 +873,10 @@ class OpenAIBackendAPI:
                 data_build=self.pow_data_build,
             )
 
-        turnstile_token = ""
-        turnstile_info = data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], source_p) or ""
+        turnstile_token = self._resolve_turnstile_requirement(
+            data.get("turnstile") or {},
+            source_p,
+        )
 
         return ChatRequirements(
             token=data.get("token", ""),
@@ -4018,7 +4083,10 @@ class OpenAIBackendAPI:
         self._report_progress("bootstrapping")
         self._bootstrap()
         self._report_progress("getting_token")
-        requirements = self._get_chat_requirements()
+        requirements = self._get_chat_requirements(
+            deadline=self.deadline_monotonic,
+            timeout_message="image request deadline exceeded",
+        )
         self._report_progress("preparing_conversation")
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
@@ -4082,7 +4150,9 @@ class OpenAIBackendAPI:
         prepare_data = response.json()
 
         if (prepare_data.get("arkose") or {}).get("required"):
-            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
+            raise HumanVerificationRequiredError(
+                "chat requirements requires arkose token, which is not implemented"
+            )
 
         proof_token = ""
         proof_info = prepare_data.get("proofofwork") or {}
@@ -4095,10 +4165,10 @@ class OpenAIBackendAPI:
                 data_build=self.pow_data_build,
             )
 
-        turnstile_token = ""
-        turnstile_info = prepare_data.get("turnstile") or {}
-        if turnstile_info.get("required") and turnstile_info.get("dx"):
-            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
+        turnstile_token = self._resolve_turnstile_requirement(
+            prepare_data.get("turnstile") or {},
+            p_token,
+        )
 
         finalize_path = base + "/finalize"
         response = self.session.post(
@@ -4114,9 +4184,15 @@ class OpenAIBackendAPI:
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
 
+        if (data.get("arkose") or {}).get("required"):
+            raise HumanVerificationRequiredError(
+                "chat requirements finalize requires arkose token"
+            )
         token = data.get("token", "")
         if not token:
             message = "missing auth chat requirements token" if self.access_token else "missing chat requirements token"
+            if (prepare_data.get("turnstile") or {}).get("required") or (data.get("turnstile") or {}).get("required"):
+                raise HumanVerificationRequiredError(f"{message}: {data}")
             raise RuntimeError(f"{message}: {data}")
 
         return ChatRequirements(

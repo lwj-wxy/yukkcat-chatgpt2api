@@ -45,10 +45,11 @@ def execute_search(
     timeout_secs: float,
     decorate: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    """Execute one search and switch Upstream Account once on auth rejection."""
+    """Execute one search and switch Upstream Account on auth or human-verification rejection."""
     deadline = time.monotonic() + max(0.001, float(timeout_secs))
     attempted_tokens: set[str] = set()
     auth_failures = 0
+    verification_switches = 0
     last_auth_error: Exception | None = None
 
     while True:
@@ -67,6 +68,28 @@ def execute_search(
             with backend_factory(access_token) as backend:
                 result = backend.search(query, timeout_secs=remaining)
         except Exception as exc:
+            failure = classify_image_exception(exc)
+            if failure.code == "verification_required":
+                last_auth_error = exc
+                try:
+                    account_service.mark_verification_required(
+                        access_token,
+                        "search",
+                        error=str(exc),
+                        expected_access_token=access_token,
+                        expected_refresh_token=str(account.get("refresh_token") or ""),
+                        expected_last_token_refresh_at=account.get("last_token_refresh_at"),
+                    )
+                except Exception as mark_error:
+                    logger.warning({
+                        "event": "verification_required_mark_failed",
+                        "source": "search",
+                        "error": repr(mark_error)[:300],
+                    })
+                verification_switches += 1
+                if verification_switches < 20 and time.monotonic() < deadline:
+                    continue
+                raise
             if not _is_account_auth_failure(exc):
                 raise
             last_auth_error = exc

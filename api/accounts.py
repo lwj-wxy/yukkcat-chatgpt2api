@@ -978,6 +978,7 @@ def _account_matches_keyword(account: dict[str, Any], keyword: str) -> bool:
         account.get("type"),
         account.get("source_type"),
         account.get("status"),
+        "待验证" if _clean_text(account.get("last_remote_check_result")).lower() == "verification_required" else "",
         account.get("proxy"),
         account.get("group_id"),
     )

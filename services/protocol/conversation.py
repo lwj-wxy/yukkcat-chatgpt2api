@@ -6,6 +6,8 @@ import io
 import json
 import re
 import time
+from contextlib import closing
+from threading import Lock
 from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
@@ -45,6 +47,7 @@ from services.image_storage_service import image_media_type, image_storage_servi
 from services.image_upscale_service import upscale_image_if_needed
 from services.openai_backend_api import OpenAIBackendAPI, SANDBOX_IMAGE_RE
 from services.proxy_service import ImageEgressDeadlineError, proxy_settings
+from services.protocol.image_edit_plan import plan_image_edits
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.helper import (
     IMAGE_MODELS,
@@ -1257,11 +1260,59 @@ def text_backend() -> OpenAIBackendAPI:
     return backend
 
 
+def _record_text_account_rejection(
+    token: str,
+    account_snapshot: Mapping[str, Any],
+    exc: BaseException,
+    source: str,
+) -> str:
+    if not token:
+        return ""
+    failure = classify_image_exception(exc)
+    expected_refresh = str(account_snapshot.get("refresh_token") or "")
+    expected_refresh_at = account_snapshot.get("last_token_refresh_at")
+    if failure.code == "verification_required":
+        try:
+            account_service.mark_verification_required(
+                token,
+                source,
+                error=str(exc),
+                expected_access_token=token,
+                expected_refresh_token=expected_refresh,
+                expected_last_token_refresh_at=expected_refresh_at,
+            )
+        except Exception as mark_error:
+            logger.warning({
+                "event": "verification_required_mark_failed",
+                "source": source,
+                "error": diagnostic_excerpt(mark_error, 300),
+            })
+        return "verification_required"
+    if isinstance(exc, Exception) and _is_account_auth_failure(exc):
+        try:
+            account_service.schedule_auth_verification(
+                token,
+                source,
+                expected_access_token=token,
+                expected_refresh_token=expected_refresh,
+                expected_last_token_refresh_at=expected_refresh_at,
+            )
+        except Exception as schedule_error:
+            logger.warning({
+                "event": "auth_verification_schedule_failed",
+                "source": source,
+                "error": diagnostic_excerpt(schedule_error, 300),
+            })
+        return "auth"
+    return ""
+
+
 def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) -> Iterator[str]:
     attempted_tokens: set[str] = set()
     token = getattr(backend, "access_token", "")
     emitted = False
     auth_failures = 0
+    verification_switches = 0
     while True:
         if token and token in attempted_tokens:
             raise RuntimeError("no available text account")
@@ -1292,28 +1343,21 @@ def stream_text_deltas(backend: OpenAIBackendAPI, request: ConversationRequest) 
             account_service.mark_text_used(token)
             return
         except Exception as exc:
-            auth_failure = bool(token and _is_account_auth_failure(exc))
-            if auth_failure:
-                try:
-                    account_service.schedule_auth_verification(
-                        token,
-                        "text_stream",
-                        expected_access_token=token,
-                        expected_refresh_token=str(
-                            account_snapshot.get("refresh_token") or ""
-                        ),
-                        expected_last_token_refresh_at=account_snapshot.get(
-                            "last_token_refresh_at"
-                        ),
-                    )
-                except Exception as schedule_error:
-                    logger.warning({
-                        "event": "auth_verification_schedule_failed",
-                        "source": "text_stream",
-                        "error": diagnostic_excerpt(schedule_error, 300),
-                    })
+            rejection = _record_text_account_rejection(
+                token,
+                account_snapshot,
+                exc,
+                "text_stream",
+            )
+            can_switch = not emitted and (
+                (rejection == "verification_required" and verification_switches < 20)
+                or (rejection == "auth" and auth_failures < 2)
+            )
+            if rejection == "verification_required":
+                verification_switches += 1
+            elif rejection == "auth":
                 auth_failures += 1
-            if auth_failure and not emitted and auth_failures < 2:
+            if can_switch:
                 token = account_service.get_text_access_token(attempted_tokens)
                 if token:
                     continue
@@ -2349,6 +2393,8 @@ def _generate_single_image(
         for output in outputs:
             output.image_attempts = attempts
 
+    max_verification_switches = 20
+
     def retry_with_different_account(
         failure: ImageFailure,
         error: ImageGenerationError | None = None,
@@ -2361,9 +2407,19 @@ def _generate_single_image(
                 and time.monotonic() >= request.deadline_monotonic
             )
             or not failure.switch_account
-            or len(image_attempts) >= max_account_attempts
         ):
             return False
+        if failure.code == "verification_required" and not emitted_for_token:
+            if len(image_attempts) >= max(max_account_attempts, max_verification_switches):
+                return False
+        else:
+            non_verification_attempts = sum(
+                1
+                for item in image_attempts
+                if item.get("failure_code") != "verification_required"
+            )
+            if non_verification_attempts >= max_account_attempts:
+                return False
         retry_token = ""
         fallback_retry_pending = False
         retry_error = attach_attempts(error or ImageGenerationError(
@@ -2653,10 +2709,10 @@ def _generate_single_image(
                 reserve_image_egress=fallback_profile is None,
                 deadline_monotonic=request.deadline_monotonic or None,
             )
-            # A text-to-image worker owns one slot. Its local file index starts at zero.
+            # A one-image worker's local index is always zero, including for edits.
             if request.file_ready:
                 backend.image_file_ready = lambda slot, url: request.file_ready(
-                    slot if request.images else index - 1, url, backend,
+                    slot if request.n > 1 else index - 1, url, backend,
                 )
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)
@@ -3042,11 +3098,74 @@ def _select_image_pool_error(errors: dict[int, Exception]) -> Exception | None:
     return selected
 
 
+def _read_edit_plan(messages: list[dict], deadline: float) -> str:
+    attempted_tokens: set[str] = set()
+    auth_failures = 0
+    verification_switches = 0
+    while time.monotonic() < deadline:
+        token = account_service.get_text_access_token(attempted_tokens)
+        if not token or token in attempted_tokens:
+            raise RuntimeError("edit planner unavailable")
+        attempted_tokens.add(token)
+        account_snapshot = account_service.get_account(token) or {}
+        try:
+            with OpenAIBackendAPI(
+                access_token=token,
+                deadline_monotonic=deadline,
+                limit_http_to_deadline=True,
+            ) as backend:
+                with closing(backend.stream_conversation(messages=messages, model="auto")) as stream:
+                    reply = ""
+                    for event in iter_conversation_payloads(
+                        stream, classify_terminal_text_as_image_failure=False
+                    ):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("edit planning timed out")
+                        structured_failure = event.get("_image_failure")
+                        if isinstance(structured_failure, ImageFailure):
+                            raise ImageFailureError(failure=structured_failure)
+                        if event.get("blocked"):
+                            raise ValueError("edit plan unavailable")
+                        reply = event["text"]
+                        if len(reply) > 32768:
+                            raise ValueError("oversized edit plan")
+            account_service.mark_text_used(token)
+            return reply
+        except Exception as exc:
+            rejection = _record_text_account_rejection(
+                token,
+                account_snapshot,
+                exc,
+                "image_edit_plan",
+            )
+            if rejection == "verification_required" and verification_switches < 20:
+                verification_switches += 1
+                continue
+            if rejection == "auth" and auth_failures < 2:
+                auth_failures += 1
+                continue
+            raise
+    raise TimeoutError("edit planning timed out")
+
+
 def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageOutput]:
-    """Keep candidate singles private until a coherent result group is known."""
-    candidates: list[ImageOutput] = []
+    """Only deliver files from one execution, even if all attempts are incomplete."""
+    if request.file_ready:
+        publish = request.file_ready
+        owner_lock = Lock()
+        owner = None
+
+        def publish_group_file(slot, url, backend):
+            nonlocal owner
+            with owner_lock:
+                if owner is not None and backend is not owner:
+                    raise ImageDownloadError("cannot combine streamed files from different edit attempts")
+                owner = backend
+            publish(slot, url, backend)
+
+        request = replace(request, file_ready=publish_group_file)
     best_group: list[ImageOutput] = []
-    best_group_size = 1
+    best_group_size = 0
     best_group_slot = 0
     attempts: list[dict[str, Any]] = []
     errors: dict[int, Exception] = {}
@@ -3073,16 +3192,14 @@ def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageO
                     current_attempts.append(dict(attempt))
         delivered = sum(len(output.data) for output in outputs if output.kind == "result")
         attempts.extend(current_attempts)
-        if delivered > 1:
+        if delivered:
             if delivered > best_group_size:
                 best_group, best_group_size, best_group_slot = outputs, delivered, index
             if delivered >= request.n:
                 break
-        elif delivered:
-            candidates.extend(output for output in outputs if output.kind == "result")
         else:
             last_outputs = outputs
-            if not candidates and not best_group and any(
+            if not best_group and any(
                 output.failure is not None and output.failure.outcome == "text"
                 for output in outputs
             ):
@@ -3093,10 +3210,6 @@ def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageO
                 attempt["result_disposition"] = "superseded"
                 attempt["result_image_count"] = 0
         for output in best_group:
-            yield replace(output, image_attempts=attempts)
-        return
-    if candidates:
-        for output in candidates:
             yield replace(output, image_attempts=attempts)
         return
     if last_outputs:
@@ -3110,7 +3223,7 @@ def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageO
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
-    """Collect an edit's first result group before scheduling remaining variants."""
+    """Schedule independent images by slot and keep coordinated edits together."""
     normalized_output_format = normalize_image_output_format(request.output_format)
     validate_image_output_request(
         request.model,
@@ -3173,11 +3286,26 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             yield output
         return
 
+    slots = None
     if request.images and not is_codex_image_model(request.model):
-        yield from _stream_grouped_image_edits(request)
-        return
+        started = time.monotonic()
+        slots, reason = plan_image_edits(request.prompt, request.images, request.n,
+                                        request.deadline_monotonic, _read_edit_plan)
+        logger.info({"event": "image_edit_routing", "call_id": request.call_id, "reason": reason,
+                     "n": request.n, "reference_count": len(request.images),
+                     "planning_ms": round((time.monotonic() - started) * 1000)})
+        if slots is None:
+            yield from _stream_grouped_image_edits(request)
+            return
 
-    # Generation without references and Codex retain their concurrency policy.
+    def worker_request(index: int) -> ConversationRequest:
+        if slots is None:
+            return replace(request, n=1)
+        slot = slots[index - 1]
+        return replace(request, n=1, images=[request.images[i - 1] for i in slot.references],
+                       prompt=(f"{request.prompt}\n\n本次只交付第 {index}/{request.n} 张图片。"
+                               f"附图对应原参考图编号 {list(slot.references)}。本张要求：{slot.instruction}"))
+
     if not config.image_parallel_generation:
         logger.info({
             "event": "image_serial_generation_start",
@@ -3188,7 +3316,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         errors: dict[int, Exception] = {}
         for index in range(1, request.n + 1):
             try:
-                outputs = _generate_single_image(replace(request, n=1), index, request.n)
+                outputs = _generate_single_image(worker_request(index), index, request.n)
             except Exception as exc:
                 _capture_failed_image_attempts(request, exc)
                 errors[index] = exc
@@ -3258,7 +3386,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
 
     try:
         for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, replace(request, n=1), index, request.n)
+            future = executor.submit(_generate_single_image, worker_request(index), index, request.n)
             futures[future] = index
 
         # yield 结果：按完成顺序立即输出，不再等所有图片都结束后才返回成功结果。

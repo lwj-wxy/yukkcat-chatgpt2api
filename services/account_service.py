@@ -836,6 +836,8 @@ class AccountService:
         )
         if credential_availability.status == "unavailable":
             return False
+        if account.get("last_remote_check_result") == "verification_required":
+            return False
         if account.get("last_remote_check_result") != "pending":
             return True
         return bool(
@@ -1073,7 +1075,7 @@ class AccountService:
         remote_check_result = str(normalized.get("last_remote_check_result") or "").strip().lower()
         normalized["last_remote_check_result"] = (
             remote_check_result
-            if remote_check_result in {"pending", "ok", "error", "invalid"}
+            if remote_check_result in {"pending", "ok", "error", "invalid", "verification_required"}
             else None
         )
         pending_remove = normalized.get("pending_auth_remove_invalid")
@@ -2135,18 +2137,29 @@ class AccountService:
     def mark_text_used(self, access_token: str) -> None:
         if not access_token:
             return
-        with self._lock:
+        with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
             current = self._accounts.get(access_token)
             if current is None:
                 return
             next_item = dict(current)
-            next_item["last_used_at"] = self._now()
+            now = self._now()
+            next_item["last_used_at"] = now
+            was_verification_required = (
+                current.get("last_remote_check_result") == "verification_required"
+            )
+            if was_verification_required:
+                next_item["last_remote_check_result"] = "ok"
+                next_item["last_remote_check_error"] = None
+                next_item["last_remote_check_error_at"] = None
+                next_item["last_remote_check_event"] = "text_used"
             account = self._normalize_account(next_item)
             if account is None:
                 return
             self._accounts[access_token] = account
             self._save_accounts()
+            if was_verification_required:
+                self._image_slot_condition.notify_all()
 
     def remove_invalid_token(
         self,
@@ -2285,7 +2298,7 @@ class AccountService:
                 token
                 for item in self._accounts.values()
                 if item.get("status") == "限流"
-                   and item.get("last_remote_check_result") != "pending"
+                   and item.get("last_remote_check_result") not in {"pending", "verification_required"}
                    and (token := item.get("access_token") or "")
             ]
 
@@ -2407,7 +2420,7 @@ class AccountService:
                 token
                 for item in self._accounts.values()
                 if item.get("status") == "正常"
-                   and item.get("last_remote_check_result") != "pending"
+                   and item.get("last_remote_check_result") not in {"pending", "verification_required"}
                    and (token := item.get("access_token") or "")
             ]
 
@@ -2918,6 +2931,8 @@ class AccountService:
     def _invalid_cleanup_reason(cls, account: dict[str, Any]) -> str | None:
         if account_status_category(account) == "abnormal":
             return "abnormal"
+        if str(account.get("last_remote_check_result") or "").strip().lower() == "verification_required":
+            return None
         if account_image_quota_state(
             account, unlimited_quota=cls.is_unlimited_image_quota_account(account),
         ) == "unknown":
@@ -3052,6 +3067,16 @@ class AccountService:
             and "restore_at" not in updates
         ):
             merged["restore_at"] = None
+        if (
+            current.get("last_remote_check_result") == "verification_required"
+            and "status" in updates
+            and "last_remote_check_result" not in updates
+            and self._normalize_account_status(updates.get("status"), merged) == "正常"
+        ):
+            merged["last_remote_check_result"] = None
+            merged["last_remote_check_error"] = None
+            merged["last_remote_check_error_at"] = None
+            merged["last_remote_check_event"] = None
 
         account = self._normalize_account(merged)
         if account is None:
@@ -3317,7 +3342,7 @@ class AccountService:
                 })
                 if refresh_token_changed:
                     normalized_updates["refresh_token_invalid_at"] = None
-                if current.get("last_remote_check_result") == "invalid":
+                if current.get("last_remote_check_result") in {"invalid", "verification_required"}:
                     normalized_updates.update({
                         "last_remote_check_result": None,
                         "last_remote_check_error": None,
@@ -3400,6 +3425,18 @@ class AccountService:
         expected_remote_check_marker: _RemoteCheckMarker,
     ) -> dict | None:
         now = datetime.now(timezone.utc).isoformat()
+        preserve_verification = expected_remote_check_marker[1] == "verification_required"
+        remote_updates = (
+            {"last_remote_check_result": "verification_required"}
+            if preserve_verification
+            else {
+                "last_remote_check_attempt_at": now,
+                "last_remote_check_error": None,
+                "last_remote_check_error_at": None,
+                "last_remote_check_event": event,
+                "last_remote_check_result": "ok",
+            }
+        )
         return self.update_account(
             access_token,
             {
@@ -3409,11 +3446,7 @@ class AccountService:
                 "last_refresh_error": None,
                 "last_refresh_error_at": None,
                 "last_remote_checked_at": now,
-                "last_remote_check_attempt_at": now,
-                "last_remote_check_error": None,
-                "last_remote_check_error_at": None,
-                "last_remote_check_event": event,
-                "last_remote_check_result": "ok",
+                **remote_updates,
                 "pending_auth_remove_invalid": None,
                 "pending_auth_scope": None,
             },
@@ -3661,6 +3694,77 @@ class AccountService:
         )
         existing_remove = account.get("pending_auth_remove_invalid")
         account["pending_auth_remove_invalid"] = bool(existing_remove) or requested_remove
+
+    @staticmethod
+    def _apply_verification_required_fields(
+        account: dict,
+        event: str,
+        now: str,
+        error: str = "",
+    ) -> None:
+        account["last_remote_check_result"] = "verification_required"
+        account["last_remote_check_event"] = event
+        account["last_remote_check_attempt_at"] = now
+        account["last_remote_check_error"] = str(error or "upstream human verification required")
+        account["last_remote_check_error_at"] = now
+        account["pending_auth_remove_invalid"] = None
+        account["pending_auth_scope"] = None
+        account.pop("pending_auth_verification_id", None)
+
+    def mark_verification_required(
+        self,
+        access_token: str,
+        event: str,
+        *,
+        error: str = "",
+        expected_access_token: str | None = None,
+        expected_refresh_token: str | None = None,
+        expected_last_token_refresh_at: str | None = None,
+    ) -> bool:
+        """Quarantine an account that upstream gated on human verification without deleting it."""
+        if not access_token:
+            return False
+        now = datetime.now(timezone.utc).isoformat()
+        with self._image_slot_condition:
+            access_token = self._resolve_access_token_locked(access_token)
+            current = self._accounts.get(access_token)
+            if current is None:
+                return False
+            expected_generation = None
+            if expected_access_token is not None and expected_refresh_token is not None:
+                expected_generation = (
+                    str(expected_access_token or "").strip(),
+                    str(expected_refresh_token or "").strip(),
+                    str(expected_last_token_refresh_at or "").strip(),
+                )
+                if self._credential_generation(access_token, current) != expected_generation:
+                    return False
+            already_marked = current.get("last_remote_check_result") == "verification_required"
+            next_item = dict(current)
+            next_item["fail"] = int(next_item.get("fail") or 0) + 1
+            self._apply_verification_required_fields(next_item, event, now, error)
+            account = self._normalize_account(next_item)
+            if account is None:
+                return False
+            self._accounts[access_token] = account
+            saved = self._save_accounts(expected_credential_generation=expected_generation)
+            if not saved:
+                return False
+            access_token = self._resolve_access_token_locked(access_token)
+            persisted = self._accounts.get(access_token)
+            if persisted is None or persisted.get("last_remote_check_result") != "verification_required":
+                return False
+            self._image_slot_condition.notify_all()
+            if not already_marked:
+                self._add_account_log_best_effort(
+                    "账号触发人工验证，已暂停派单",
+                    {
+                        "source": event,
+                        "token": anonymize_token(access_token),
+                        "error": self._credential_error_text(error, persisted, access_token=access_token),
+                    },
+                )
+        return True
 
     def schedule_auth_verification(
         self,
@@ -4096,6 +4200,7 @@ class AccountService:
             return None
         now = datetime.now(timezone.utc)
         should_verify_after_failure = False
+        marked_verification_required = False
         consumed_quota = success if quota_consumed is None else bool(quota_consumed)
         with self._image_slot_condition:
             access_token = self._resolve_access_token_locked(access_token)
@@ -4121,6 +4226,11 @@ class AccountService:
                 image_quota_unknown = bool(next_item.get("image_quota_unknown"))
                 if success:
                     next_item["success"] = int(next_item.get("success") or 0) + 1
+                    if next_item.get("last_remote_check_result") == "verification_required":
+                        next_item["last_remote_check_result"] = "ok"
+                        next_item["last_remote_check_error"] = None
+                        next_item["last_remote_check_error_at"] = None
+                        next_item["last_remote_check_event"] = "image_success"
                 if consumed_quota:
                     if not image_quota_unknown:
                         current_quota = max(0, int(next_item.get("quota") or 0))
@@ -4135,7 +4245,17 @@ class AccountService:
                         next_item["status"] = "正常"
                         next_item["image_quota_unknown"] = True
                         next_item["restore_at"] = None
-                if not success and failure is not None and failure.verify_account:
+                if not success and failure is not None and failure.code == "verification_required":
+                    already_marked = current.get("last_remote_check_result") == "verification_required"
+                    next_item["fail"] = int(next_item.get("fail") or 0) + 1
+                    self._apply_verification_required_fields(
+                        next_item,
+                        "image_human_verification",
+                        now.isoformat(),
+                        str(failure.raw_detail or "upstream human verification required"),
+                    )
+                    marked_verification_required = not already_marked
+                elif not success and failure is not None and failure.verify_account:
                     next_item["fail"] = int(next_item.get("fail") or 0) + 1
                     self._mark_remote_check_pending(
                         next_item,
@@ -4153,13 +4273,28 @@ class AccountService:
                 )
                 if not saved:
                     should_verify_after_failure = False
+                    marked_verification_required = False
                     return None
                 access_token = self._resolve_access_token_locked(access_token)
                 persisted = self._accounts.get(access_token)
                 if persisted is None:
                     should_verify_after_failure = False
+                    marked_verification_required = False
                     return None
                 result = dict(persisted)
+                if marked_verification_required:
+                    self._add_account_log_best_effort(
+                        "账号触发人工验证，已暂停派单",
+                        {
+                            "source": "image_human_verification",
+                            "token": anonymize_token(access_token),
+                            "error": self._credential_error_text(
+                                failure.raw_detail if failure is not None else "",
+                                persisted,
+                                access_token=access_token,
+                            ),
+                        },
+                    )
             finally:
                 self._image_slot_condition.notify_all()
         if should_verify_after_failure:
@@ -5267,11 +5402,24 @@ class AccountService:
         with self._lock:
             items = list(self._accounts.values())
         total = len(items)
-        active = sum(1 for a in items if a.get("status") == "正常")
-        limited = sum(1 for a in items if a.get("status") == "限流")
+        normal_items = [
+            a
+            for a in items
+            if a.get("status") == "正常"
+            and a.get("last_remote_check_result") != "verification_required"
+        ]
+        active = len(normal_items)
+        limited = sum(
+            1
+            for a in items
+            if a.get("status") == "限流"
+            or (
+                a.get("status") == "正常"
+                and a.get("last_remote_check_result") == "verification_required"
+            )
+        )
         abnormal = sum(1 for a in items if a.get("status") == "异常")
         disabled = sum(1 for a in items if a.get("status") == "禁用")
-        normal_items = [a for a in items if a.get("status") == "正常"]
         total_quota = sum(max(0, int(a.get("quota") or 0)) for a in normal_items)
         unlimited = sum(1 for a in normal_items if self._is_unlimited_image_quota_account(a))
         unknown_quota = sum(

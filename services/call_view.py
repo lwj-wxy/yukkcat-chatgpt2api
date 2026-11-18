@@ -32,6 +32,7 @@ _IMAGE_FAILURE_LABELS = {
     "image_quota_exhausted": "图片额度已用尽",
     "file_upload_throttled": "参考图上传受限",
     "auth_invalid": "账号登录态失效",
+    "verification_required": "账号需人工验证",
     "content_policy_violation": "内容安全策略拒绝",
     "invalid_image_input": "图片输入无效",
     "upstream_text_reply": "上游仅返回文本",

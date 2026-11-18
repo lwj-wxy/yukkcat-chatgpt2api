@@ -19,6 +19,7 @@ HTTP 400 的图片结果被分类为文本结果：`content_policy_violation`、
 | 类别 | 典型含义 | 对外状态 |
 | --- | --- | --- |
 | `auth_invalid` | 上游鉴权无效 | 401 |
+| `verification_required` | 上游要求账号人工验证（暂停派单并切换其他账号，保留账号不自动删除） | 403 |
 | `upstream_rate_limited` / `image_quota_exhausted` | 限流或图片额度耗尽 | 429 |
 | `image_poll_timeout` | 等待图片结果超时 | 502 |
 | `image_stream_timeout` / `image_stream_interrupted` | SSE 超时或中断 | 502 |

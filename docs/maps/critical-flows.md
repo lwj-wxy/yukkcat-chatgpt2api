@@ -111,11 +111,20 @@ terminal state. `ImageStorageService` exclusively owns Image Asset catalogue and
 storage mutations. Studio owns browser conversation presentation and polling,
 not task truth.
 
-For multi-image Conversation edits, `stream_image_outputs_with_pool` first
-collects successive executions under one deadline. Single images remain
-candidates until the result shape is known. A multi-file group is delivered
-from one conversation and supersedes earlier singles; otherwise accumulated
-single-image variants are delivered after the execution slots finish.
+For multi-image Web edits, the gateway sends the brief, requested count and a numbered
+preview of the references to the existing multimodal text backend. Planning has a
+15-second limit within the request deadline. An independent plan must supply one
+instruction and valid reference indices for each requested output. Each worker gets
+its own original references and one output slot. The image pool runs these workers
+according to the parallel-generation setting. Direct streaming preserves slot indices
+when workers finish out of order. For coordinated edits, invalid plans, or an unavailable
+planner, the gateway selects the largest result from one execution under the shared deadline.
+Separate executions cannot contribute different pieces of one split image. Direct streaming
+requires the complete requested count before reporting batch completion. Accounts that hit
+an explicit upstream human-verification requirement before emitting output are marked
+`verification_required` (projected as pending verification rather than invalid credentials,
+and excluded from scheduling and automatic deletion) while planning, independent slots, and
+grouped sessions switch to another eligible Upstream Account within the request deadline.
 `OpenAIBackendAPI` resolves final assistant sandbox images through their
 conversation and message IDs, validates downloads, and hands bytes to the
 existing image formatting/storage path. Missing file URLs are retried in the

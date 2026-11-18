@@ -159,12 +159,15 @@ def _effective_status_category(
     backend_category: AccountStatusCategory,
     credential_lifecycle: dict[str, Any],
     quota_state: ImageQuotaState | None = None,
+    remote_result: str = "",
 ) -> AccountStatusCategory:
-    if quota_state == "unknown":
-        return "abnormal"
     if backend_category in {"disabled", "abnormal"}:
         return backend_category
     if credential_lifecycle["credential_availability"] == "unavailable":
+        return "abnormal"
+    if remote_result == "verification_required":
+        return "limited"
+    if quota_state == "unknown":
         return "abnormal"
     return backend_category
 
@@ -175,8 +178,13 @@ def _status(
     quota_state: ImageQuotaState,
 ) -> tuple[AccountStatusCategory, str, PresentationTone, str, str, str]:
     backend_category = _backend_status_category(account)
-    category = _effective_status_category(backend_category, credential_lifecycle, quota_state)
     remote_result = _text(account.get("last_remote_check_result")).lower()
+    category = _effective_status_category(
+        backend_category,
+        credential_lifecycle,
+        quota_state,
+        remote_result,
+    )
     raw_error = _diagnostic(
         (
             account.get("last_remote_check_error")
@@ -190,10 +198,12 @@ def _status(
         reason_code, reason = "auth_invalid", "远程确认账号登录态已失效"
     elif backend_category != "disabled" and credential_lifecycle["credential_availability"] == "unavailable":
         reason_code, reason = "credentials_unavailable", "AT 已失效，且没有可用 RT，账号无法参与调度"
-    elif quota_state == "unknown":
-        reason_code, reason = "image_quota_unknown", "图片额度未确认，可手动清除"
     elif backend_category == "disabled":
         reason_code, reason = "disabled", "账号已手动禁用"
+    elif remote_result == "verification_required":
+        reason_code, reason = "verification_required", "上游要求人工验证，已暂停派单；处理后可测试或重置恢复"
+    elif quota_state == "unknown":
+        reason_code, reason = "image_quota_unknown", "图片额度未确认，可手动清除"
     elif backend_category == "limited":
         reason_code, reason = "image_quota_exhausted", "远程确认图片额度已用完"
     elif remote_result == "pending":
@@ -205,9 +215,16 @@ def _status(
     else:
         reason_code, reason = "", "账号已启用，当前凭据可调用"
 
+    status_label = (
+        "待验证"
+        if reason_code == "verification_required"
+        else "失效"
+        if category == "abnormal"
+        else _STATUS_LABEL[category]
+    )
     return (
         category,
-        "失效" if category == "abnormal" else _STATUS_LABEL[category],
+        status_label,
         _STATUS_TONE[category],
         reason_code,
         reason,
@@ -220,6 +237,7 @@ def account_status_category(account: dict[str, Any]) -> AccountStatusCategory:
     return _effective_status_category(
         _backend_status_category(account),
         _credential_lifecycle(account),
+        remote_result=_text(account.get("last_remote_check_result")).lower(),
     )
 
 
@@ -228,6 +246,7 @@ def account_list_status_category(account: dict[str, Any], *, unlimited_quota: bo
         _backend_status_category(account),
         _credential_lifecycle(account),
         account_image_quota_state(account, unlimited_quota=unlimited_quota),
+        _text(account.get("last_remote_check_result")).lower(),
     )
 
 

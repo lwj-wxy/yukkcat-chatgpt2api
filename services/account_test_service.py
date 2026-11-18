@@ -5,6 +5,7 @@ from typing import Literal, cast
 
 from services.account_processing import account_processing_slot
 from services.account_service import account_service
+from services.image_failure import classify_image_exception
 from services.openai_backend_api import OpenAIBackendAPI
 from services.protocol.conversation import (
     ConversationRequest,
@@ -94,6 +95,15 @@ class AccountTestService:
                 content = self._execute_chat(account, model=model, prompt=prompt)
                 images = []
         except Exception as exc:
+            failure = classify_image_exception(exc)
+            if failure.code == "verification_required":
+                access_token = str(account.get("access_token") or "").strip()
+                if access_token:
+                    account_service.mark_verification_required(
+                        access_token,
+                        f"account_test_{mode}",
+                        error=str(exc),
+                    )
             duration_ms = int((time.perf_counter() - started) * 1000)
             message = sanitize_diagnostic_text(str(exc)).strip() or "账号测试失败"
             return {
