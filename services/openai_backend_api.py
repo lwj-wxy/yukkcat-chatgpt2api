@@ -3452,7 +3452,7 @@ class OpenAIBackendAPI:
                         continue
                     # A native preview can stabilize before the assistant publishes
                     # its edited files. Check the active branch before regenerating.
-                    if terminal_failure is None and expected_files > 1 and max(len(file_ids), len(sediment_ids)) == 1:
+                    if terminal_failure is None and max(len(file_ids), len(sediment_ids)) < expected_files:
                         node = (conversation.get("mapping") or {}).get(conversation.get("current_node")) or {}
                         message = node.get("message") or {}
                         final_reply = (

@@ -1894,10 +1894,16 @@ def stream_image_outputs(
     last: dict[str, Any] = {}
     conversation_stream_started = time.perf_counter()
     conversation_wall_started = time.time()
+    upstream_prompt = request.prompt
+    if request.images and request.n > 1:
+        upstream_prompt += (
+            f"\n\n本次请求需要 {request.n} 张独立的结果图片。请按上述编辑要求完成，"
+            "并在本次对话的最终回复中按顺序附上每张实际生成的图片或其文件下载链接。"
+        )
     try:
         for event in conversation_events(
                 backend,
-                prompt=request.prompt,
+                prompt=upstream_prompt,
                 model=request.model,
                 images=request.images or [],
                 size=request.size,
@@ -3010,6 +3016,9 @@ def _select_image_pool_error(errors: dict[int, Exception]) -> Exception | None:
 def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageOutput]:
     """Keep candidate singles private until a coherent result group is known."""
     candidates: list[ImageOutput] = []
+    best_group: list[ImageOutput] = []
+    best_group_size = 1
+    best_group_slot = 0
     attempts: list[dict[str, Any]] = []
     errors: dict[int, Exception] = {}
     last_outputs: list[ImageOutput] = []
@@ -3034,26 +3043,29 @@ def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageO
                 if attempt not in current_attempts:
                     current_attempts.append(dict(attempt))
         delivered = sum(len(output.data) for output in outputs if output.kind == "result")
-        if delivered > 1:
-            # Prefer one conversation's group to unrelated earlier singles.
-            for attempt in attempts:
-                if attempt.get("status") == "success":
-                    attempt["result_disposition"] = "superseded"
-                    attempt["result_image_count"] = 0
-            attempts.extend(current_attempts)
-            for output in outputs:
-                yield replace(output, image_attempts=attempts)
-            return
         attempts.extend(current_attempts)
-        if delivered:
+        if delivered > 1:
+            if delivered > best_group_size:
+                best_group, best_group_size, best_group_slot = outputs, delivered, index
+            if delivered >= request.n:
+                break
+        elif delivered:
             candidates.extend(output for output in outputs if output.kind == "result")
         else:
             last_outputs = outputs
-            if not candidates and any(
+            if not candidates and not best_group and any(
                 output.failure is not None and output.failure.outcome == "text"
                 for output in outputs
             ):
                 break
+    if best_group:
+        for attempt in attempts:
+            if attempt.get("status") == "success" and attempt.get("slot") != best_group_slot:
+                attempt["result_disposition"] = "superseded"
+                attempt["result_image_count"] = 0
+        for output in best_group:
+            yield replace(output, image_attempts=attempts)
+        return
     if candidates:
         for output in candidates:
             yield replace(output, image_attempts=attempts)

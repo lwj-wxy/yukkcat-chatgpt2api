@@ -20,8 +20,11 @@ Recover terminal assistant PNG/JPEG/WebP/GIF files from the authenticated
 current conversation. For multi-image Conversation edits, execute the first
 attempt before allocating subsequent execution slots. Single images are held
 as candidates; a later multi-file group supersedes them. A result group stays
-within one conversation and never exceeds the requested count. A group with fewer
-images remains partial; do not combine it with another execution's slices.
+within one conversation and never exceeds the requested count. If a group is
+short, subsequent slots may supply a complete group within the request budget.
+On exhaustion return the largest coherent group without mixing executions.
+The upstream edit prompt carries the requested number of separate image files
+and asks for each result in order in the final reply.
 
 No local cropping, keyword intent classifier, new user controls, changes to
 account eligibility/automatic cleanup, storage migration, or deployment.
@@ -29,7 +32,7 @@ Generation without references and Codex/SVG paths retain their scheduling.
 Single-result edits execute successive variants serially and can take longer
 than the previous parallel execution. One request-wide deadline bounds them.
 The system cannot infer that a native single image is an unwanted collage.
-If a multi-image edit has one stable native candidate and the active branch
+If a multi-image edit has fewer stable native candidates than requested and the active branch
 still has an intermediate message, probe that conversation every two seconds
 for up to eight additional seconds before accepting the candidate. A published
 group wins immediately. The existing request and poll deadlines still apply.

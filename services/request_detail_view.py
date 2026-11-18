@@ -352,8 +352,9 @@ def build_request_timeline_presentation(
                     if status := _int(sample.get("http_status")):
                         ttfb = format_request_duration(_int(sample.get("http_ttfb_ms")))
                         http_info = f"（HTTP {status}，首字节 {ttfb}）"
+                    label = "图" if sample.get("source") == "sandbox" else "候选图"
                     description_parts.append(
-                        f"图 {_int(sample.get('image'))} 第 {_int(sample.get('round'))} 次 "
+                        f"{label} {_int(sample.get('image'))} 第 {_int(sample.get('round'))} 次 "
                         f"{format_request_duration(_int(sample.get('elapsed_ms')))} {result}{http_info}"
                     )
         if key == "download_ms" and image_count > 0:
