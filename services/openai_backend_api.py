@@ -3868,6 +3868,56 @@ class OpenAIBackendAPI:
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
         return self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
 
+    def iter_image_file(self, url: str, deadline: float, limit: int) -> Iterator[bytes]:
+        """Read an upstream file under its original authorization and redirect scope."""
+        current_url = url
+        for redirect in range(4):
+            parsed = urlparse(current_url)
+            origin = urlparse(self.base_url)
+            if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
+                raise ImageDownloadError("invalid image download URL")
+            same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
+            timeout = self._remaining_timeout(deadline, "image download deadline exceeded")
+            if same_origin:
+                response = self.session.get(
+                    current_url, headers=self._headers(parsed.path or "/"),
+                    timeout=min(120, timeout), allow_redirects=False, stream=True,
+                )
+            else:
+                parsed, addresses = validate_public_image_url(current_url)
+                # Signed assets carry their own authorization. Use a
+                # separate, pinned connection with no account cookies.
+                response = requests.get(
+                    current_url, headers={"Accept": "image/*,application/octet-stream"},
+                    timeout=min(120, self._remaining_timeout(deadline, "image download deadline exceeded")),
+                    allow_redirects=False, stream=True,
+                    curl_options=image_fetch_curl_options(parsed, addresses),
+                )
+            try:
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("Location")
+                    if not location or redirect == 3:
+                        raise ImageDownloadError("image download redirect limit exceeded")
+                    current_url = urljoin(current_url, location)
+                    continue
+                ensure_ok(response, "image_download", credential_scope="account" if same_origin else "signed_asset")
+                length = response.headers.get("Content-Length", "")
+                if str(length).isdigit() and int(length) > limit:
+                    raise ImageDownloadError("image download exceeds size limit")
+                size = 0
+                for chunk in response.iter_content(chunk_size=48 * 1024):
+                    self._remaining_timeout(deadline, "image download deadline exceeded")
+                    size += len(chunk)
+                    if size > limit:
+                        raise ImageDownloadError("image download size limit exceeded")
+                    if chunk:
+                        yield chunk
+                if str(length).isdigit() and not response.headers.get("Content-Encoding") and size != int(length):
+                    raise ImageDownloadError("incomplete image download")
+                return
+            finally:
+                response.close()
+
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images: list[bytes] = []
         total_bytes = 0
@@ -3875,51 +3925,8 @@ class OpenAIBackendAPI:
         for url in dict.fromkeys(urls):
             for attempt in range(2):
                 try:
-                    current_url = url
-                    content = b""
-                    for redirect in range(4):
-                        parsed = urlparse(current_url)
-                        origin = urlparse(self.base_url)
-                        if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
-                            raise ImageDownloadError("invalid image download URL")
-                        same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
-                        timeout = self._remaining_timeout(deadline, "image download deadline exceeded")
-                        if same_origin:
-                            response = self.session.get(
-                                current_url, headers=self._headers(parsed.path or "/"),
-                                timeout=min(120, timeout), allow_redirects=False, stream=True,
-                            )
-                        else:
-                            parsed, addresses = validate_public_image_url(current_url)
-                            # Signed assets carry their own authorization. Use a
-                            # separate, pinned connection with no account cookies.
-                            response = requests.get(
-                                current_url, headers={"Accept": "image/*,application/octet-stream"},
-                                timeout=min(120, self._remaining_timeout(deadline, "image download deadline exceeded")),
-                                allow_redirects=False, stream=True,
-                                curl_options=image_fetch_curl_options(parsed, addresses),
-                            )
-                        try:
-                            if 300 <= response.status_code < 400:
-                                location = response.headers.get("Location")
-                                if not location or redirect == 3:
-                                    raise ImageDownloadError("image download redirect limit exceeded")
-                                current_url = urljoin(current_url, location)
-                                continue
-                            ensure_ok(response, "image_download", credential_scope="account" if same_origin else "signed_asset")
-                            length = response.headers.get("Content-Length", "")
-                            if str(length).isdigit() and int(length) > 50 * 1024 * 1024:
-                                raise ImageDownloadError("image download exceeds 50MB limit")
-                            buffer = bytearray()
-                            for chunk in response.iter_content(chunk_size=64 * 1024):
-                                self._remaining_timeout(deadline, "image download deadline exceeded")
-                                if len(buffer) + len(chunk) > 50 * 1024 * 1024 or total_bytes + len(buffer) + len(chunk) > 100 * 1024 * 1024:
-                                    raise ImageDownloadError("image download size limit exceeded")
-                                buffer.extend(chunk)
-                            content = bytes(buffer)
-                            break
-                        finally:
-                            response.close()
+                    limit = min(50 * 1024 * 1024, 100 * 1024 * 1024 - total_bytes)
+                    content = b"".join(self.iter_image_file(url, deadline, limit))
                     if not content:
                         if attempt == 0:
                             logger.warning({

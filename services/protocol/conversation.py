@@ -685,7 +685,7 @@ class ConversationRequest:
     call_id: str = ""
     trace_image_perf: bool = False
     monitor_attempt: int = 0
-    file_ready: Callable[[int, str], None] | None = None
+    file_ready: Callable[[int, str, OpenAIBackendAPI], None] | None = None
     deadline_monotonic: float = 0.0
 
 
@@ -717,6 +717,7 @@ class ImageOutput:
     upstream_event_type: str = ""
     data: list[dict[str, Any]] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)
+    deliver_selected_files: Callable[[int], None] | None = field(default=None, repr=False, compare=False)
     image_attempts: list[dict[str, Any]] = field(default_factory=list)
     account_email: str = ""
     conversation_id: str = ""
@@ -1842,14 +1843,27 @@ def _image_result_output_from_urls(
 ) -> ImageOutput | None:
     if not image_urls:
         return None
-    if request.response_format == "upstream_url":
+    if request.response_format == "upstream_stream":
         from services.protocol.direct_image_stream import asset_identity
         distinct = {}
         for url in image_urls:
             distinct.setdefault(asset_identity(url), url)
-        return ImageOutput("result", request.model, index, total,
-                           data=[{"url": url} for url in list(distinct.values())[:request.n]],
-                           conversation_id=conversation_id)
+        urls = list(distinct.values())[:request.n]
+        if len(urls) == request.n:
+            for slot, url in enumerate(urls):
+                backend.image_file_ready(slot, url)
+        output = ImageOutput("result", request.model, index, total,
+                             data=[{"url": url} for url in urls], conversation_id=conversation_id)
+        if request.file_ready and len(urls) < request.n:
+            # A single edit can be superseded by a later coherent group. Only
+            # retrieve it if the group selector eventually keeps that candidate.
+            def deliver_selected(first_slot):
+                with OpenAIBackendAPI(access_token=backend.access_token, proxy_profile=backend.proxy_profile,
+                                      deadline_monotonic=request.deadline_monotonic) as reader:
+                    for offset, url in enumerate(urls):
+                        request.file_ready(first_slot + offset, url, reader)
+            output.deliver_selected_files = deliver_selected
+        return output
     if request.progress_callback:
         request.progress_callback("receiving_image")
     downloaded_images = _download_image_bytes_with_monitor(
@@ -2640,10 +2654,10 @@ def _generate_single_image(
                 deadline_monotonic=request.deadline_monotonic or None,
             )
             # A text-to-image worker owns one slot. Its local file index starts at zero.
-            if request.file_ready and not request.images:
-                backend.image_file_ready = lambda _, url: request.file_ready(index - 1, url)
-            else:
-                backend.image_file_ready = request.file_ready
+            if request.file_ready:
+                backend.image_file_ready = lambda slot, url: request.file_ready(
+                    slot if request.images else index - 1, url, backend,
+                )
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)
                 if using_fallback_profile:
@@ -2810,7 +2824,7 @@ def _generate_single_image(
                     conversation_id=attempt_conversation_id,
                     image_attempts=image_attempts,
                 )
-            if request.response_format != "upstream_url":
+            if request.response_format != "upstream_stream":
                 _cleanup_image_conversations_after_success(backend, outputs)
             finalize_image_slot(True, result_image_count=sum(
                 len(output.data) for output in outputs if output.kind == "result"

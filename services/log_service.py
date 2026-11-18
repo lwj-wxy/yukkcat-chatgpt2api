@@ -359,8 +359,8 @@ def image_result_metrics(value: object) -> dict[str, object]:
             url = item.get("url")
             if isinstance(url, str) and url.strip():
                 metrics["result_url_count"] = int(metrics["result_url_count"]) + 1
-                if item.get("type") == "image.ready":
-                    metrics["result_data_count"] += 1
+            if item.get("type") == "image.ready":
+                metrics["result_data_count"] += 1
             b64_json = item.get("b64_json")
             if isinstance(b64_json, str) and b64_json.strip():
                 metrics["result_b64_count"] = int(metrics["result_b64_count"]) + 1
@@ -673,7 +673,7 @@ class LoggedCall:
                             result_metrics.setdefault(key, []).extend(value)
                         else:
                             result_metrics[key] = result_metrics.get(key, 0) + value
-                if self.trace_metadata.get("response_format") != "upstream_url":
+                if self.trace_metadata.get("response_format") != "upstream_stream":
                     urls.extend(_collect_urls(item))
                 account_emails.extend(_collect_account_emails(item))
                 conversation_ids.extend(_collect_conversation_ids(item))

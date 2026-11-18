@@ -1,15 +1,17 @@
 """Incremental handoff of upstream raster files to the caller's image store."""
 from __future__ import annotations
 
-from queue import Queue
-from threading import Event, Thread
+import base64
+import hashlib
+import time
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread
 from urllib.parse import parse_qsl, urlsplit
 
 from fastapi import HTTPException
 
 from services.image_failure import ImageDownloadError
 from utils.helper import is_codex_image_model
-from utils.image_download_urls import validate_public_image_url
 
 
 def asset_identity(url):
@@ -22,54 +24,88 @@ def asset_identity(url):
     return parsed.netloc.lower(), parsed.path, tuple(sorted(query))
 
 
-def public_asset(url):
-    try:
-        parsed, _ = validate_public_image_url(url)
-        if parsed.scheme != "https":
-            raise ValueError
-    except (ValueError, OSError):
-        raise ImageDownloadError("upstream did not provide a public HTTPS image URL") from None
-    return url
-
-
 def direct_stream(request, stream, generate):
     if not stream or is_codex_image_model(request.model) or str(request.output_format).lower() in {"svg", "gif"}:
-        raise HTTPException(400, "upstream_url requires a streaming Web raster image request")
+        raise HTTPException(400, "upstream_stream requires a streaming Web raster image request")
 
     def events():
-        queue = Queue()
+        queue = Queue(maxsize=6)
         closed = Event()
+        lock = Lock()
+        slots = {}
 
-        def ready(index, url):
-            if closed.is_set():
-                raise ImageDownloadError("image delivery was cancelled")
-            queue.put(("ready", (index, url)))
+        def send(kind, value):
+            while not closed.is_set():
+                try:
+                    queue.put((kind, value), timeout=0.2)
+                    return
+                except Full:
+                    if request.deadline_monotonic and time.monotonic() >= request.deadline_monotonic:
+                        closed.set()
+                    continue
+            raise ImageDownloadError("image delivery was cancelled")
+
+        def ready(index, url, backend):
+            identity = asset_identity(url)
+            with lock:
+                if slots.get(index) == identity:
+                    return
+                if index in slots or identity in slots.values() or not 0 <= index < request.n:
+                    raise ImageDownloadError("upstream returned conflicting image slots")
+                slots[index] = identity
+            try:
+                send("event", {"type": "image.start", "index": index})
+                size = 0
+                digest = hashlib.sha256()
+                deadline = backend.deadline_monotonic or time.monotonic() + 120
+                for chunk in backend.iter_image_file(url, deadline, 32 << 20):
+                    size += len(chunk)
+                    digest.update(chunk)
+                    for offset in range(0, len(chunk), 48 * 1024):
+                        frame = chunk[offset:offset + 48 * 1024]
+                        send("event", {"type": "image.chunk", "index": index,
+                                       "chunk": base64.b64encode(frame).decode("ascii")})
+                if not size:
+                    raise ImageDownloadError("empty upstream image")
+                send("event", {"type": "image.ready", "index": index, "bytes": size,
+                               "sha256": digest.hexdigest()})
+            except Exception:
+                if not closed.is_set():
+                    send("error", ImageDownloadError("upstream image transfer failed"))
+                raise
 
         def run():
             request.file_ready = ready
             attempts = []
-            singles = 0
+            count = 0
             try:
                 for output in generate(request):
                     for attempt in output.image_attempts:
                         if attempt not in attempts:
                             attempts.append(attempt)
-                    if output.kind != "result":
-                        continue
-                    for offset, item in enumerate(output.data):
-                        index = (singles if request.images and len(output.data) == 1
-                                 else offset if request.images else output.index - 1)
-                        ready(index, item["url"])
-                    singles += len(output.data)
-                queue.put(("done", attempts))
+                    if output.kind == "result":
+                        if output.deliver_selected_files:
+                            output.deliver_selected_files(count)
+                        count += len(output.data)
+                if count != request.n:
+                    exc = ImageDownloadError(f"upstream supplied {count} of {request.n} images")
+                    exc.image_attempts = attempts
+                    raise exc
+                send("done", attempts)
             except Exception as exc:
-                queue.put(("error", exc))
+                if not closed.is_set():
+                    send("error", exc)
 
         Thread(target=run, name="upstream-image-delivery", daemon=True).start()
-        sent = {}
+        sent = set()
         try:
             while True:
-                kind, value = queue.get()
+                try:
+                    kind, value = queue.get(timeout=0.5)
+                except Empty:
+                    if closed.is_set():
+                        raise ImageDownloadError("image delivery timed out")
+                    continue
                 if kind == "error":
                     raise value
                 if kind == "done":
@@ -79,14 +115,9 @@ def direct_stream(request, stream, generate):
                         raise exc
                     yield {"type": "image_batch.completed", "count": len(sent), "_image_attempts": value}
                     return
-                index, url = value
-                identity = asset_identity(url)
-                if sent.get(index) == identity:
-                    continue
-                if not 0 <= index < request.n or index in sent or identity in sent.values():
-                    raise ImageDownloadError("upstream returned conflicting image slots")
-                sent[index] = identity
-                yield {"type": "image.ready", "index": index, "url": public_asset(url)}
+                if value["type"] == "image.ready":
+                    sent.add(value["index"])
+                yield value
         finally:
             closed.set()
 
