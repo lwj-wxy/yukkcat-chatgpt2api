@@ -45,8 +45,18 @@ bypass raster upscaling/re-encoding and are stored with `.gif` and `image/gif`;
 SVG generation uses the text account pool for generation requests only;
 reference images and streaming are rejected. The result is validated as bounded
 static XML and stored with its original bytes, `.svg`, and `image/svg+xml`. The
-other explicit formats are converted locally before storage. Existing `n` and
-multi-image behavior is unchanged.
+other explicit formats are converted locally before storage.
+
+`stream_image_outputs_with_pool` schedules `n` image slots. Each Web/Codex slot
+receives a one-file output constraint and, for a batch, its position in the
+collection. `_generate_single_image` accepts at most the first result image
+per successful attempt, across all result outputs. Both SSE and JSON collectors
+consume these bounded results, so one slot cannot supply another slot's image.
+Missing slots remain missing; successful results still stream in completion
+order. Attempts record `upstream_image_count`, `result_image_count`, and
+`discarded_image_count`. Counts refer to validated images returned by the
+upstream adapter; discarded images may already have been downloaded or stored.
+The original prompt and API `n` are retained in request logs.
 
 The 2.5 identifiers use the existing `auto` upstream Web model slug. They are
 compatibility names and do not force a particular official API image engine or

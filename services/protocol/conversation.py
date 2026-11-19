@@ -1877,6 +1877,20 @@ def _image_result_output_from_urls(
     )
 
 
+def _image_slot_prompt(prompt: str, index: int, total: int) -> str:
+    # Use the explicit API count, never infer the batch size from prompt text.
+    instruction = "Return exactly one image file for this task."
+    if total > 1:
+        instruction += (
+            f" This is task {index} of {total} separate image tasks."
+            f" If the brief describes an ordered collection, produce only image {index};"
+            " otherwise produce one independent variant. Keep the shared visual requirements."
+            " Do not generate the other images or combine the collection into a collage."
+        )
+    instruction += " If animation is requested, keep all requested frames in one animation file."
+    return f"{prompt}\n\nOutput constraint: {instruction}"
+
+
 def stream_image_outputs(
         backend: OpenAIBackendAPI,
         request: ConversationRequest,
@@ -1894,7 +1908,7 @@ def stream_image_outputs(
     try:
         for event in conversation_events(
                 backend,
-                prompt=request.prompt,
+                prompt=_image_slot_prompt(request.prompt, index, total),
                 model=request.model,
                 images=request.images or [],
                 size=request.size,
@@ -2196,7 +2210,7 @@ def stream_codex_image_outputs(
 ) -> Iterator[ImageOutput]:
     codex_started = time.perf_counter()
     events = list(backend.iter_codex_image_response_events(
-        prompt=request.prompt,
+        prompt=_image_slot_prompt(request.prompt, index, total),
         images=request.images or [],
         size=request.size,
         quality=request.quality,
@@ -2671,6 +2685,8 @@ def _generate_single_image(
                 )
             stream_fn = stream_codex_image_outputs if is_codex_image_model(request.model) else stream_image_outputs
             outputs: list[ImageOutput] = []
+            upstream_image_count = 0
+            delivered_image_count = 0
             stream_started = time.perf_counter()
             for output in stream_fn(backend, request, index, total):
                 if account_email and not output.account_email:
@@ -2692,7 +2708,17 @@ def _generate_single_image(
                     )
                 emitted_for_token = True
                 returned_message = output.kind == "message"
-                returned_result = returned_result or output.kind == "result"
+                if output.kind == "result":
+                    upstream_image_count += len(output.data)
+                    # A successful slot owns one image. Surplus images from this
+                    # account must never fill another slot, even across outputs.
+                    keep = max(0, 1 - delivered_image_count)
+                    output.data = output.data[:keep]
+                    output.image_urls = output.image_urls[:len(output.data)]
+                    if not output.data:
+                        continue
+                    delivered_image_count += len(output.data)
+                    returned_result = True
                 outputs.append(output)
             stream_ms = int((time.perf_counter() - stream_started) * 1000)
             if request.trace_image_perf:
@@ -2774,7 +2800,22 @@ def _generate_single_image(
                 )
             _cleanup_image_conversations_after_success(backend, outputs)
             finalize_image_slot(True)
+            image_attempts[-1].update({
+                "result_image_count": delivered_image_count,
+                "upstream_image_count": upstream_image_count,
+                "discarded_image_count": upstream_image_count - delivered_image_count,
+            })
             attach_attempts_to_outputs(outputs)
+            if upstream_image_count > delivered_image_count:
+                logger.warning({
+                    "event": "image_slot_surplus_discarded",
+                    "call_id": request.call_id,
+                    "index": index,
+                    "total": total,
+                    "upstream_image_count": upstream_image_count,
+                    "result_image_count": delivered_image_count,
+                    "discarded_image_count": upstream_image_count - delivered_image_count,
+                })
             if request.trace_image_perf:
                 result_images = image_output_metadata([
                     item for output in outputs if output.kind == "result" for item in output.data
@@ -2801,6 +2842,8 @@ def _generate_single_image(
                     "quality": request.quality,
                     "response_format": request.response_format,
                     "image_count": len(result_images),
+                    "upstream_image_count": upstream_image_count,
+                    "discarded_image_count": upstream_image_count - delivered_image_count,
                     "result_images": result_images,
                 })
             return outputs

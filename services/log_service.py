@@ -144,9 +144,13 @@ IMAGE_ATTEMPT_KEYS = {
     "conversation_id",
     "duration_ms",
     "monitor",
+    "result_image_count",
+    "upstream_image_count",
+    "discarded_image_count",
 }
 IMAGE_ATTEMPT_INTEGER_KEYS = {
     "slot", "attempt", "duration_ms", "status_code", "failure_retry_after",
+    "result_image_count", "upstream_image_count", "discarded_image_count",
 }
 IMAGE_ATTEMPT_BOOLEAN_KEYS = {
     "failure_retryable", "failure_account_failure", "account_failure", "switched_account",
