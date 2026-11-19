@@ -623,7 +623,7 @@ class RealtimeMonitorService:
             compact_event = {
                 key: value
                 for key, value in event.items()
-                if key in {"time", "event", "label", "status", "file_url_probes", *CANONICAL_FAILURE_FIELDS}
+                if key in {"time", "event", "label", "status", *CANONICAL_FAILURE_FIELDS}
                 or key in {"public_error", "account_failure", "switched_account"}
                 or (str(key).endswith("_ms") and _int_ms(value) > 0)
             }
@@ -872,7 +872,7 @@ class RealtimeMonitorService:
                 {
                     key: value
                     for key, value in event.items()
-                    if key in {"time", "event", "label", "index", "total", "attempt", "status", "file_url_probes"}
+                    if key in {"time", "event", "label", "index", "total", "attempt", "status"}
                     or key in CANONICAL_FAILURE_FIELDS
                     or key in {"public_error", "account_failure", "switched_account"}
                     or key in RAW_DIAGNOSTIC_FIELDS
@@ -952,7 +952,6 @@ class RealtimeMonitorService:
                 "poll_wait_ms",
                 "poll_request_ms",
                 "resolve_ms",
-                "file_url_probes",
                 "download_ms",
                 "response_ms",
                 "stream_ms",

@@ -111,29 +111,6 @@ terminal state. `ImageStorageService` exclusively owns Image Asset catalogue and
 storage mutations. Studio owns browser conversation presentation and polling,
 not task truth.
 
-Multi-image Web reference edits enter the grouped edit path directly with the
-original references, prompt and requested count. When a complete group is available,
-the gateway delivers it from one execution. Direct streaming preserves file indices
-and requires the requested count before reporting batch completion. Generation
-without references and Codex requests follow the configured concurrency policy.
-Upstream Accounts marked `verification_required` are excluded from scheduling
-and automatic deletion.
-`OpenAIBackendAPI` resolves final assistant sandbox images through their
-conversation and message IDs, validates downloads, and hands bytes to the
-existing image formatting/storage path. Missing file URLs are retried in the
-same conversation for at most five multi-file probes (four for a single file) within 30 seconds and the remaining
-request/poll budget; already resolved URLs are retained. Link resolution uses up
-to three workers and retains reply order. Multi-file edits count healthy probe
-time toward the polling interval. Stream file hints shorten the first wait, but
-only the authenticated conversation can identify output files. An incomplete
-sandbox group is rechecked within the existing poll deadline. Authentication failures
-stop immediately. Retry sleeps count as polling wait, not URL resolution time.
-It reuses current-turn selection from
-`image_failure` and public URL/DNS validation from `utils/image_download_urls`.
-Call Record attempts carry `result_image_count` and an optional
-`result_disposition=superseded` through log normalization and storage; the backend groups their labels without
-fabricating extra attempts or counting unselected candidates as delivered.
-
 ## Call Record, live monitor, and metrics
 
 ```mermaid

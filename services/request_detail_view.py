@@ -343,20 +343,6 @@ def build_request_timeline_presentation(
             description_parts.append(_request_shape_image_summary(request_shape))
         if key == "resolve_ms" and image_count > 0:
             description_parts.append(f"结果图 {image_count}")
-        if key == "resolve_ms":
-            for event in events or []:
-                for probe in _record(event).get("file_url_probes") or []:
-                    sample = _record(probe)
-                    result = {"ready": "就绪", "pending": "未就绪", "error": "失败"}.get(sample.get("result"), "")
-                    http_info = ""
-                    if status := _int(sample.get("http_status")):
-                        ttfb = format_request_duration(_int(sample.get("http_ttfb_ms")))
-                        http_info = f"（HTTP {status}，首字节 {ttfb}）"
-                    label = "图" if sample.get("source") == "sandbox" else "候选图"
-                    description_parts.append(
-                        f"{label} {_int(sample.get('image'))} 第 {_int(sample.get('round'))} 次 "
-                        f"{format_request_duration(_int(sample.get('elapsed_ms')))} {result}{http_info}"
-                    )
         if key == "download_ms" and image_count > 0:
             description_parts.append(f"下载 {image_count} 张")
         tone = _timeline_metric_tone(key, value_ms)

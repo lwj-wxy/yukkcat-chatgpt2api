@@ -10,8 +10,6 @@
 
 HTTP 400 的图片结果被分类为文本结果：`content_policy_violation`、`invalid_image_input`、`upstream_text_reply` 和 `unsupported_model`。这类结果会保留可展示的上游文本，不将账号切换或账号记失败。
 
-含有当前会话图片文件的终态回复先进入文件回收和真实图片校验；不能仅因回复主体为文本就直接判为 `upstream_text_reply`。文件无法解析、下载或解码时使用 `image_download_failed`。多变体调用已经交付有效图片时，其他变体的文本结果会保留在尝试记录中，不抹掉已交付图片。
-
 其他 `ImageFailure` 的 `outcome` 是失败，允许执行账号切换与账号验证流程。是否实际切换还取决于账号池、尝试上限和当前设置；分类对象只给出一致的切换资格，不保证一定能找到下一个账号。
 
 常见类别包括：
@@ -19,7 +17,6 @@ HTTP 400 的图片结果被分类为文本结果：`content_policy_violation`、
 | 类别 | 典型含义 | 对外状态 |
 | --- | --- | --- |
 | `auth_invalid` | 上游鉴权无效 | 401 |
-| `verification_required` | 上游要求账号人工验证（暂停派单并切换其他账号，保留账号不自动删除） | 403 |
 | `upstream_rate_limited` / `image_quota_exhausted` | 限流或图片额度耗尽 | 429 |
 | `image_poll_timeout` | 等待图片结果超时 | 502 |
 | `image_stream_timeout` / `image_stream_interrupted` | SSE 超时或中断 | 502 |

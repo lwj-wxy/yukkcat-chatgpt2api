@@ -12,10 +12,10 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from io import BytesIO
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Dict, Iterator, Optional
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import unquote, urlparse
 
 from curl_cffi import CurlInfo, CurlOpt, requests
 from PIL import Image
@@ -24,14 +24,12 @@ from services.account_service import account_service
 from services.config import config
 from services.editable_file_failure import EditableFileFailureError
 from services.image_failure import (
-    HumanVerificationRequiredError,
     ImageDownloadError,
     ImageFailure,
     ImageFailureError,
     ImagePollTimeoutError,
     InvalidAccessTokenError,
     classify_conversation_failure,
-    current_conversation_turn,
     classify_image_exception,
     classify_upstream_message,
     classify_task_failure,
@@ -44,7 +42,6 @@ from services.image_failure import (
 from services.protocol.reasoning import normalize_thinking_effort
 from services.proxy_service import ProxyRuntimeProfile, proxy_settings
 from utils.file_names import sanitize_public_filename
-from utils.image_download_urls import validate_public_image_url, image_fetch_curl_options
 from utils.helper import UpstreamHTTPError, ensure_ok, iter_sse_payloads, new_uuid, split_image_model
 from utils.diagnostics import diagnostic_excerpt
 from utils.log import logger
@@ -93,10 +90,6 @@ EDITABLE_FILE_PPT_PROMPT = """我需要你根据用户的需求，来制作一�
 最后只需要给我生成一个PPT文件，以及生成中遇到的各种素材压缩包zip文件就行。"""
 EDITABLE_FILE_PSD_PROMPT = "帮我生成这个图像，把这张海报分成若干图像，包括背景图，每个元素不要改位置，这样子我可以直接在 平时里无需拖动，底色为白色，不要伪透明底。再帮我将以上拆分的图像拼合成一个psd文件，去除白色底，不要改变每个图层的相应位置，保留每个元素所在图层的相应位置，保留每个元素的图层，最后只需要给我输出psd文件，以及每个图层的zip文件"
 EDITABLE_ASSET_POINTER_RE = re.compile(r"(?:file-service|sediment)://([A-Za-z0-9_-]+)")
-SANDBOX_IMAGE_RE = re.compile(
-    r"(?:sandbox:|(?<=\]\())(/mnt/data/[^\s\"'<>\)\]]+\.(?:png|jpe?g|webp|gif))(?=[\s\"'<>\)\]]|$)",
-    re.IGNORECASE,
-)
 
 HTTP_TIMING_INFOS = (
     CurlInfo.NAMELOOKUP_TIME,
@@ -185,14 +178,6 @@ def _response_http_timing(response: Any) -> dict[str, Any]:
     return timing
 
 
-def _capture_url_response(probe: dict | None, response: Any) -> None:
-    if probe is not None:
-        timing = _response_http_timing(response)
-        for key in ("http_status", "http_dns_ms", "http_tcp_ms", "http_tls_ms", "http_wait_ms", "http_ttfb_ms"):
-            if key in timing:
-                probe[key] = timing[key]
-
-
 @dataclass
 class EditableFileArtifact:
     attachment_id: str = ""
@@ -255,9 +240,8 @@ class OpenAIBackendAPI:
         self.pow_data_build = ""
         self.progress_callback: Callable[[str], None] | None = None
         self._http_timings: dict[str, dict[str, Any]] = {}
-        self._reset_image_result_timing()
+        self._image_result_timing: dict[str, int] = {}
         self._closed = False
-        self.deadline_monotonic = deadline_monotonic
         explicit_proxy = str(proxy or proxy_url or "").strip()
         self.proxy_profile = proxy_profile or proxy_settings.get_profile(
             account=self.account,
@@ -387,30 +371,9 @@ class OpenAIBackendAPI:
                 "error": diagnostic_excerpt(exc, 500),
             })
 
-    def _mark_verification_required(self, event: str, error: str = "") -> None:
-        if not self._credential_access_token:
-            return
-        try:
-            account_service.mark_verification_required(
-                self._credential_access_token,
-                event,
-                error=error,
-                expected_access_token=self._credential_access_token,
-                expected_refresh_token=self._credential_refresh_token,
-                expected_last_token_refresh_at=self._credential_last_token_refresh_at,
-            )
-        except Exception as exc:
-            logger.warning({
-                "event": "verification_required_mark_failed",
-                "source": event,
-                "error": diagnostic_excerpt(exc, 500),
-            })
-
     def _raise_editable_failure(self, failure: ImageFailure, event: str) -> None:
         if failure.code == "auth_invalid":
             self._schedule_auth_recovery(event)
-        elif failure.code == "verification_required":
-            self._mark_verification_required(event, str(failure.raw_detail or ""))
         raise EditableFileFailureError(failure=failure)
 
     def _raise_editable_http_failure(
@@ -442,23 +405,6 @@ class OpenAIBackendAPI:
 
     def _reset_image_result_timing(self) -> None:
         self._image_result_timing = {}
-        self._file_url_probes: list[dict[str, Any]] = []
-
-    def pop_file_url_probes(self) -> list[dict]:
-        probes = sorted(getattr(self, "_file_url_probes", ()), key=lambda p: (p["image"], p["round"]))
-        self._file_url_probes = []
-        return probes
-
-    def _timed_file_url(self, index: int, round_number: int, source: str, lookup: Callable[[dict], str]) -> str:
-        probe = {"image": index, "round": round_number, "source": source, "result": "error"}
-        started = time.perf_counter()
-        try:
-            url = lookup(probe)
-            probe["result"] = "ready" if url else "pending"
-            return url
-        finally:
-            probe["elapsed_ms"] = round((time.perf_counter() - started) * 1000)
-            self._file_url_probes.append(probe)
 
     def _add_image_result_timing(self, key: str, milliseconds: float) -> None:
         if not key:
@@ -783,6 +729,9 @@ class OpenAIBackendAPI:
             "restore_at": restore_at,
             "status": "正常" if image_quota_unknown or quota > 0 else "限流",
         }
+        account_id = str(default_account.get("account_id") or "").strip()
+        if account_id:
+            result["account_id"] = account_id
         if plan_type:
             result["type"] = plan_type
         logger.debug({
@@ -814,33 +763,10 @@ class OpenAIBackendAPI:
             "Upgrade-Insecure-Requests": "1",
         }
 
-    @staticmethod
-    def _resolve_turnstile_requirement(turnstile_info: Dict[str, Any], source_p: str) -> str:
-        if not turnstile_info.get("required"):
-            return ""
-        dx = turnstile_info.get("dx")
-        if not dx:
-            raise HumanVerificationRequiredError(
-                "chat requirements requires interactive turnstile verification"
-            )
-        try:
-            token = solve_turnstile_token(dx, source_p) or ""
-        except Exception as exc:
-            raise HumanVerificationRequiredError(
-                f"chat requirements turnstile verification failed: {exc}"
-            ) from exc
-        if not token:
-            raise HumanVerificationRequiredError(
-                "chat requirements turnstile verification could not be completed"
-            )
-        return token
-
     def _build_requirements(self, data: Dict[str, Any], source_p: str = "") -> ChatRequirements:
         """把 sentinel 响应整理成后续对话需要的 token 集合。"""
         if (data.get("arkose") or {}).get("required"):
-            raise HumanVerificationRequiredError(
-                "chat requirements requires arkose token, which is not implemented"
-            )
+            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
 
         proof_token = ""
         proof_info = data.get("proofofwork") or {}
@@ -853,10 +779,10 @@ class OpenAIBackendAPI:
                 data_build=self.pow_data_build,
             )
 
-        turnstile_token = self._resolve_turnstile_requirement(
-            data.get("turnstile") or {},
-            source_p,
-        )
+        turnstile_token = ""
+        turnstile_info = data.get("turnstile") or {}
+        if turnstile_info.get("required") and turnstile_info.get("dx"):
+            turnstile_token = solve_turnstile_token(turnstile_info["dx"], source_p) or ""
 
         return ChatRequirements(
             token=data.get("token", ""),
@@ -2251,7 +2177,6 @@ class OpenAIBackendAPI:
             artifact: EditableFileArtifact,
             *,
             deadline: float | None = None,
-            probe: dict | None = None,
     ) -> str:
         ids: list[str] = []
         for item in (artifact.attachment_id, artifact.file_id):
@@ -2265,7 +2190,6 @@ class OpenAIBackendAPI:
                 params={"message_id": artifact.message_id, "sandbox_path": artifact.sandbox_path},
                 timeout=self._editable_request_timeout(deadline, 60),
             )
-            _capture_url_response(probe, response)
             if url := self._editable_download_url_candidate(response, path):
                 return url
         for attachment_id in ids:
@@ -3052,121 +2976,13 @@ class OpenAIBackendAPI:
         }
         return snapshot, diagnostic_excerpt(terminal_assistant_text(data), 2000)
 
-    def _resolve_sandbox_image_urls(
-            self, conversation_id: str, conversation: Dict[str, Any], *, deadline: float,
-            expected_files: int = 1,
-            group_announced: bool = False,
-    ) -> list[str] | None:
-        # Only the final assistant on the current branch may publish a group.
-        # Earlier turns, user attachments and intermediate tool files are inputs.
-        if conversation.get("current_node") not in (conversation.get("mapping") or {}):
-            return []
-        message: dict[str, Any] = {}
-        for candidate in reversed(current_conversation_turn(conversation)):
-            role = (candidate.get("author") or {}).get("role")
-            terminal = candidate.get("end_turn") is True or is_terminal_message_status(candidate.get("status"))
-            if role == "assistant" and terminal and candidate.get("recipient", "all") == "all":
-                message = dict(candidate)
-                break
-        if not message:
-            return []
-        failure = classify_upstream_message(message)
-        if failure is not None and failure.code != "upstream_text_reply":
-            return []
-        message_id = str(message.get("id") or "")
-        if not message_id:
-            return []
-        paths = list(dict.fromkeys(unquote(p) for p in SANDBOX_IMAGE_RE.findall(self._editable_message_text(message))))
-        if len(paths) > config.image_max_n:
-            raise ImageDownloadError("image file group exceeds the configured image limit")
-        artifacts: list[EditableFileArtifact] = []
-        for path in paths:
-            if (not path.startswith("/mnt/data/") or ".." in PurePosixPath(path).parts
-                    or "\\" in path or "%" in path or any(ord(char) < 32 for char in path)):
-                raise ImageDownloadError("invalid sandbox image path")
-            artifacts.append(EditableFileArtifact(
-                name=PurePosixPath(path).name, sandbox_path=path,
-                message_id=message_id, author_role="assistant",
-            ))
-        if not artifacts:
-            return []
-        # A single ungrouped file can still be a candidate for a variant edit.
-        required = expected_files if group_announced or len(artifacts) > 1 else 1
-        if len(artifacts) < required:
-            # A subsequent snapshot may contain the remaining links.
-            return None
-        # A terminal reply may precede publication of its files. Keep the same
-        # conversation/message and retry only missing URLs before regenerating.
-        deadline = min(deadline, time.monotonic() + 30.0,
-                       getattr(self, "deadline_monotonic", None) or deadline)
-        resolved: dict[str, str] = {}
-        indices = {a.sandbox_path: i for i, a in enumerate(artifacts, 1)}
-
-        def resolve(artifact: EditableFileArtifact) -> tuple[str, float]:
-            if time.monotonic() >= deadline:
-                return "", 0.0
-            try:
-                url = self._timed_file_url(
-                    indices[artifact.sandbox_path], probe + 1, "sandbox",
-                    lambda sample: self._resolve_editable_download_url(conversation_id, artifact, deadline=deadline, probe=sample),
-                )
-                # Only a complete terminal manifest fixes the meaning of each slot.
-                publish = getattr(self, "image_file_ready", None)
-                index = indices[artifact.sandbox_path]
-                if url and publish and len(artifacts) >= expected_files and index <= expected_files:
-                    publish(index - 1, url)
-                return url, 0.0
-            except Exception as exc:
-                failure = classify_image_exception(exc)
-                if failure.capability == "auth":
-                    raise
-                if not failure.retryable:
-                    raise ImageDownloadError("could not resolve a conversation image file") from exc
-                return "", float(failure.retry_after or 0)
-
-        delays = (1, 2, 4, 7) if required > 1 else (2, 4, 8)
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            for probe in range(len(delays) + 1):
-                pending = [a for a in artifacts if a.sandbox_path not in resolved]
-                if len(pending) <= 3:
-                    # curl_cffi reuses connections per thread. Keep one lookup on
-                    # the polling thread and keep worker connections across retries.
-                    futures = [pool.submit(resolve, a) for a in pending[1:]]
-                    urls = [resolve(pending[0]), *(future.result() for future in futures)]
-                else:
-                    urls = list(pool.map(resolve, pending))
-                for artifact, (url, _) in zip(pending, urls):
-                    if url:
-                        resolved[artifact.sandbox_path] = url
-                if len(resolved) == len(artifacts):
-                    ordered = list(dict.fromkeys(resolved[a.sandbox_path] for a in artifacts))
-                    if len(ordered) < required:
-                        raise ImageDownloadError("conversation did not publish enough distinct image files")
-                    return ordered
-                remaining = deadline - time.monotonic()
-                if probe == len(delays) or remaining <= 0:
-                    break
-                retry_after = max(delay for _, delay in urls)
-                wait = min(max(delays[probe], retry_after), remaining)
-                logger.info({
-                    "event": "image_file_resolution_retry", "conversation_id": conversation_id,
-                    "attempt": probe + 1, "pending_count": len(artifacts) - len(resolved),
-                    "sleep_secs": round(wait, 3),
-                })
-                self._sleep_for_image_poll(wait)
-        error = ImageDownloadError("conversation image file is unavailable after bounded retries")
-        error.conversation_id = conversation_id
-        raise error
-
     def _poll_image_results(
             self,
             conversation_id: str,
             timeout_secs: float = 120.0,
             initial_file_ids: list[str] | None = None,
             initial_sediment_ids: list[str] | None = None,
-            expected_files: int = 1,
-            announced_files: int = 0,
-    ) -> tuple[list[str], list[str], list[str]]:
+    ) -> tuple[list[str], list[str]]:
         """Poll the conversation document until image file ids appear or budget runs out.
 
         - Sleeps image_poll_initial_wait_secs first (default 5s, +jitter). ChatGPT
@@ -3183,8 +2999,6 @@ class OpenAIBackendAPI:
         attempt = 0
         interval = float(config.image_poll_interval_secs)
         initial_wait = float(config.image_poll_initial_wait_secs)
-        if announced_files:
-            initial_wait = min(initial_wait, 1.0)
         file_ids: list[str] = []
         sediment_ids: list[str] = []
         self._add_unique(file_ids, initial_file_ids or [])
@@ -3193,8 +3007,6 @@ class OpenAIBackendAPI:
         last_hit_key: tuple[tuple[str, ...], tuple[str, ...]] | None = (
             (tuple(file_ids), tuple(sediment_ids)) if has_initial_ids else None
         )
-        native_settle_until = 0.0
-        final_reply_wait_started: float | None = None
         logger.info({
             "event": "image_poll_start",
             "conversation_id": conversation_id,
@@ -3242,7 +3054,6 @@ class OpenAIBackendAPI:
             return True
 
         last_task_error = ""
-        pending_file_group = False
         pending_task_failure: ImageFailure | None = None
         task_probe_failure: ImageFailure | None = None
         task_probe_error: Exception | None = None
@@ -3286,13 +3097,12 @@ class OpenAIBackendAPI:
             raise exc
 
         while _remaining() > 0:
-            probe_started = time.monotonic()
             attempt += 1
             task_count = 0
             task_check_ok = False
             task_query_started = time.perf_counter()
             try:
-                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=min(5.0, max(0.001, _remaining())))
+                tasks = self._query_backend_tasks(conversation_id=conversation_id, timeout_secs=5.0)
                 task_count = len(tasks)
                 task_check_ok = True
                 task_probe_failure = None
@@ -3347,7 +3157,7 @@ class OpenAIBackendAPI:
                                 "conversation_id": conversation_id,
                                 "error": diagnostic_excerpt(recovery_exc, 300),
                             })
-                        return file_ids, sediment_ids, []
+                        return file_ids, sediment_ids
                     _raise_final_failure(
                         task_probe_failure,
                         raw_detail=str(exc),
@@ -3371,9 +3181,7 @@ class OpenAIBackendAPI:
             conversation_query_started = time.perf_counter()
             try:
                 try:
-                    conversation = self._get_conversation(
-                        conversation_id, timeout_secs=max(0.001, min(60.0, _remaining())),
-                    )
+                    conversation = self._get_conversation(conversation_id)
                 finally:
                     self._add_image_result_timing(
                         "poll_request_ms",
@@ -3416,33 +3224,6 @@ class OpenAIBackendAPI:
             conversation_transport_failure = None
             conversation_transport_error = None
             last_conversation_snapshot, last_assistant_text = self._conversation_poll_snapshot(conversation)
-
-            conversation_failure = classify_conversation_failure(conversation)
-            terminal_failure = merge_message_failure(pending_task_failure, conversation_failure)
-            if terminal_failure is None or terminal_failure.code == "upstream_text_reply":
-                resolve_started = time.perf_counter()
-                early_settle_probe = time.monotonic() < native_settle_until
-                wait_before = self._image_result_timing.get("poll_wait_ms", 0)
-                try:
-                    sandbox_urls = self._resolve_sandbox_image_urls(
-                        conversation_id, conversation, deadline=started_at + timeout_secs,
-                        expected_files=expected_files,
-                        group_announced=pending_file_group or announced_files > 1 or early_settle_probe,
-                    )
-                finally:
-                    retry_wait = self._image_result_timing.get("poll_wait_ms", 0) - wait_before
-                    self._add_image_result_timing(
-                        "resolve_ms", (time.perf_counter() - resolve_started) * 1000 - retry_wait,
-                    )
-                if sandbox_urls:
-                    return [], [], sandbox_urls
-                pending_file_group = pending_file_group or (sandbox_urls is None and not early_settle_probe)
-                if pending_file_group:
-                    remaining = _remaining()
-                    if remaining <= 0:
-                        break
-                    self._sleep_for_image_poll(min(interval, 2.0, remaining))
-                    continue
 
             for record in self._extract_image_tool_records(conversation):
                 for file_id in record["file_ids"]:
@@ -3493,71 +3274,31 @@ class OpenAIBackendAPI:
                     # 先check再hit 机制关闭：直接返回首次发现的 file_ids
                     logger.info({"event": "image_poll_hit_no_settle", "conversation_id": conversation_id,
                                  "file_ids": file_ids, "sediment_ids": sediment_ids})
-                    return file_ids, sediment_ids, []
+                    return file_ids, sediment_ids
                 hit_key = (tuple(file_ids), tuple(sediment_ids))
                 if last_hit_key == hit_key:
-                    remaining_settle = native_settle_until - time.monotonic()
-                    if remaining_settle > 0:
-                        self._sleep_for_image_poll(min(remaining_settle, max(0.0, _remaining())))
-                        continue
-                    # A native preview can stabilize before the assistant publishes
-                    # its edited files. Check the active branch before regenerating.
-                    if terminal_failure is None and max(len(file_ids), len(sediment_ids)) < expected_files:
-                        node = (conversation.get("mapping") or {}).get(conversation.get("current_node")) or {}
-                        message = node.get("message") or {}
-                        final_reply = (
-                            (message.get("author") or {}).get("role") == "assistant"
-                            and message.get("recipient", "all") == "all"
-                            and (message.get("content") or {}).get("content_type") == "text"
-                            and (message.get("end_turn") is True or is_terminal_message_status(message.get("status")))
-                        )
-                        if message and not final_reply:
-                            now = time.monotonic()
-                            if final_reply_wait_started is None:
-                                final_reply_wait_started = now
-                                logger.info({"event": "image_poll_await_final_reply", "conversation_id": conversation_id})
-                            processing_files = any(
-                                m.get("recipient") == "python" or (m.get("author") or {}).get("name") == "python"
-                                for m in current_conversation_turn(conversation)
-                            )
-                            grace = 25.0 if processing_files else 8.0
-                            wait = min(2.0, final_reply_wait_started + grace - now)
-                            if wait > 0 and _remaining() > wait + 1.0:
-                                self._sleep_for_image_poll(wait)
-                                continue
                     logger.info({"event": "image_poll_hit", "conversation_id": conversation_id, "file_ids": file_ids,
                                  "sediment_ids": sediment_ids})
-                    return file_ids, sediment_ids, []
+                    return file_ids, sediment_ids
                 last_hit_key = hit_key
                 if not config.image_settle_enabled:
                     # 二次确认机制关闭：直接返回首次发现的 file_ids
                     logger.info({"event": "image_poll_hit_settle_disabled", "conversation_id": conversation_id,
                                  "file_ids": file_ids, "sediment_ids": sediment_ids})
-                    return file_ids, sediment_ids, []
+                    return file_ids, sediment_ids
                 logger.info({"event": "image_poll_hit_pending_settle", "conversation_id": conversation_id,
                              "file_ids": file_ids, "sediment_ids": sediment_ids,
                              "settle_secs": config.image_settle_secs})
                 wait = min(config.image_settle_secs, max(0.0, _remaining()))
-                if expected_files > 1 and wait > 2.0:
-                    # Check for a complete final reply during native-ID settling.
-                    # The early probe cannot publish an unchanged native candidate.
-                    native_settle_until = time.monotonic() + wait
-                    wait = 2.0
                 if wait > 0:
                     self._sleep_for_image_poll(wait)
                     continue
-                return file_ids, sediment_ids, []
+                return file_ids, sediment_ids
             logger.debug({"event": "image_poll_wait", "conversation_id": conversation_id,
                           "elapsed_secs": round(time.monotonic() - started_at, 1)})
-            # For multi-file edits, measure the polling interval between probe
-            # starts. A slow healthy query already consumed part of the interval.
-            probe_time = time.monotonic() - probe_started if expected_files > 1 and task_check_ok else 0.0
-            wait = min(max(0.0, interval - probe_time), max(0.0, _remaining()))
+            wait = min(interval, max(0.0, _remaining()))
             if wait > 0:
                 self._sleep_for_image_poll(wait)
-        if pending_file_group and not (pending_task_failure or task_probe_failure or conversation_transport_failure):
-            _raise_final_failure(image_failure("image_download_failed"),
-                                 raw_detail=f"conversation did not publish all {expected_files} image files before timeout")
         timeout_failure = image_failure("image_poll_timeout")
         final_failure = merge_message_failure(pending_task_failure, task_probe_failure)
         final_failure = merge_message_failure(final_failure, conversation_transport_failure)
@@ -3609,22 +3350,20 @@ class OpenAIBackendAPI:
             raw_upstream_message=last_assistant_text,
         )
 
-    def _get_file_download_url(self, file_id: str, *, probe: dict | None = None) -> str:
+    def _get_file_download_url(self, file_id: str) -> str:
         """获取文件下载地址。"""
         path = f"/backend-api/files/{file_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=60)
-        _capture_url_response(probe, response)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
 
-    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str, *, probe: dict | None = None) -> str:
+    def _get_attachment_download_url(self, conversation_id: str, attachment_id: str) -> str:
         """通过 conversation 附件接口获取下载地址。"""
         path = f"/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download"
         response = self.session.get(self.base_url + path, headers=self._headers(path, {"Accept": "application/json"}),
                                     timeout=60)
-        _capture_url_response(probe, response)
         ensure_ok(response, path)
         data = response.json()
         return data.get("download_url") or data.get("url") or ""
@@ -3694,18 +3433,15 @@ class OpenAIBackendAPI:
         urls: list[str] = []
         resolution_errors: list[tuple[ImageFailure, Exception]] = []
         skip_patterns = {"file_upload"}
-        candidate_index = 0
 
         def resolve_candidate(
                 source: str,
                 asset_id: str,
-                resolver: Callable[[dict], str],
+                resolver: Callable[[], str],
         ) -> str:
-            nonlocal candidate_index
-            candidate_index += 1
             for attempt in range(2):
                 try:
-                    url = str(self._timed_file_url(candidate_index, attempt + 1, source, resolver) or "").strip()
+                    url = str(resolver() or "").strip()
                 except Exception as exc:
                     failure = classify_image_exception(exc)
                     missing_candidate = (
@@ -3778,7 +3514,7 @@ class OpenAIBackendAPI:
             url = resolve_candidate(
                 "file",
                 file_id,
-                lambda probe: self._get_file_download_url(file_id, probe=probe),
+                lambda file_id=file_id: self._get_file_download_url(file_id),
             )
             if url:
                 if url not in urls:
@@ -3788,10 +3524,9 @@ class OpenAIBackendAPI:
                 url = resolve_candidate(
                     "sediment",
                     sediment_id,
-                    lambda probe: self._get_attachment_download_url(
+                    lambda sediment_id=sediment_id: self._get_attachment_download_url(
                         conversation_id,
                         sediment_id,
-                        probe=probe,
                     ),
                 )
                 if url and url not in urls:
@@ -3844,15 +3579,11 @@ class OpenAIBackendAPI:
             sediment_ids: list[str],
             poll: bool = True,
             poll_timeout_secs: float | None = None,
-            expected_files: int = 1,
-            announced_files: int = 0,
     ) -> list[str]:
         self._reset_image_result_timing()
         file_ids = [item for item in file_ids if item != "file_upload"]
         sediment_ids = list(sediment_ids)
         timeout = poll_timeout_secs if poll_timeout_secs is not None else config.image_poll_timeout_secs
-        if getattr(self, "deadline_monotonic", None):
-            timeout = min(timeout, self._remaining_timeout(self.deadline_monotonic, "image request deadline exceeded"))
         # 当 check-before-hit 和 settle 均已关闭，且 SSE 已给出 file_ids 时，
         # 跳过轮询直接解析 URL，省去 initial_wait + 轮询耗时。
         if poll and conversation_id and (file_ids or sediment_ids):
@@ -3873,13 +3604,11 @@ class OpenAIBackendAPI:
                 "poll_timeout_secs": timeout,
             })
             try:
-                polled_file_ids, polled_sediment_ids, sandbox_urls = self._poll_image_results(
+                polled_file_ids, polled_sediment_ids = self._poll_image_results(
                     conversation_id,
                     timeout,
                     file_ids,
                     sediment_ids,
-                    expected_files=expected_files,
-                    announced_files=announced_files,
                 )
             except ImagePollTimeoutError as exc:
                 if not file_ids and not sediment_ids:
@@ -3894,8 +3623,6 @@ class OpenAIBackendAPI:
                 if not file_ids and not sediment_ids:
                     raise
                 failure = classify_image_exception(exc)
-                if failure.scope == "delivery":
-                    raise
                 if failure.capability == "auth":
                     self._schedule_auth_recovery("image_result_probe_after_success")
                 logger.warning({
@@ -3907,71 +3634,36 @@ class OpenAIBackendAPI:
                     "error": diagnostic_excerpt(repr(exc), 300),
                 })
             else:
-                if sandbox_urls:
-                    return sandbox_urls
                 file_ids.extend(item for item in polled_file_ids if item and item not in file_ids)
                 sediment_ids.extend(item for item in polled_sediment_ids if item and item not in sediment_ids)
         return self._resolve_image_urls_with_timing(conversation_id, file_ids, sediment_ids)
 
-    def iter_image_file(self, url: str, deadline: float, limit: int) -> Iterator[bytes]:
-        """Read an upstream file under its original authorization and redirect scope."""
-        current_url = url
-        for redirect in range(4):
-            parsed = urlparse(current_url)
-            origin = urlparse(self.base_url)
-            if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password:
-                raise ImageDownloadError("invalid image download URL")
-            same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
-            timeout = self._remaining_timeout(deadline, "image download deadline exceeded")
-            if same_origin:
-                response = self.session.get(
-                    current_url, headers=self._headers(parsed.path or "/"),
-                    timeout=min(120, timeout), allow_redirects=False, stream=True,
-                )
-            else:
-                parsed, addresses = validate_public_image_url(current_url)
-                # Signed assets carry their own authorization. Use a
-                # separate, pinned connection with no account cookies.
-                response = requests.get(
-                    current_url, headers={"Accept": "image/*,application/octet-stream"},
-                    timeout=min(120, self._remaining_timeout(deadline, "image download deadline exceeded")),
-                    allow_redirects=False, stream=True,
-                    curl_options=image_fetch_curl_options(parsed, addresses),
-                )
-            try:
-                if 300 <= response.status_code < 400:
-                    location = response.headers.get("Location")
-                    if not location or redirect == 3:
-                        raise ImageDownloadError("image download redirect limit exceeded")
-                    current_url = urljoin(current_url, location)
-                    continue
-                ensure_ok(response, "image_download", credential_scope="account" if same_origin else "signed_asset")
-                length = response.headers.get("Content-Length", "")
-                if str(length).isdigit() and int(length) > limit:
-                    raise ImageDownloadError("image download exceeds size limit")
-                size = 0
-                for chunk in response.iter_content(chunk_size=48 * 1024):
-                    self._remaining_timeout(deadline, "image download deadline exceeded")
-                    size += len(chunk)
-                    if size > limit:
-                        raise ImageDownloadError("image download size limit exceeded")
-                    if chunk:
-                        yield chunk
-                if str(length).isdigit() and not response.headers.get("Content-Encoding") and size != int(length):
-                    raise ImageDownloadError("incomplete image download")
-                return
-            finally:
-                response.close()
-
     def download_image_bytes(self, urls: list[str]) -> list[bytes]:
         images: list[bytes] = []
-        total_bytes = 0
-        deadline = getattr(self, "deadline_monotonic", None) or time.monotonic() + 120
-        for url in dict.fromkeys(urls):
+        for url in urls:
+            parsed_url = urlparse(url)
+            same_origin = (
+                not parsed_url.netloc
+                or parsed_url.netloc.lower() == urlparse(self.base_url).netloc.lower()
+            )
+            download_headers = (
+                self._headers(parsed_url.path or "/")
+                if same_origin
+                else self._signed_asset_headers()
+            )
             for attempt in range(2):
                 try:
-                    limit = min(50 * 1024 * 1024, 100 * 1024 * 1024 - total_bytes)
-                    content = b"".join(self.iter_image_file(url, deadline, limit))
+                    response = self.session.get(
+                        url,
+                        headers=download_headers,
+                        timeout=120,
+                    )
+                    ensure_ok(
+                        response,
+                        "image_download",
+                        credential_scope="account" if same_origin else "signed_asset",
+                    )
+                    content = bytes(response.content or b"")
                     if not content:
                         if attempt == 0:
                             logger.warning({
@@ -3981,17 +3673,8 @@ class OpenAIBackendAPI:
                             })
                             continue
                         raise ImageDownloadError("image download returned an empty response")
-                    try:
-                        with Image.open(BytesIO(content)) as image:
-                            if image.format not in {"PNG", "JPEG", "WEBP", "GIF"}:
-                                raise ValueError("unsupported image file format")
-                            image.verify()
-                        with Image.open(BytesIO(content)) as image:
-                            image.load()
-                    except Exception as exc:
-                        raise ImageDownloadError("downloaded file is not a valid image") from exc
-                    images.append(content)
-                    total_bytes += len(content)
+                    if content not in images:
+                        images.append(content)
                     break
                 except ImageDownloadError:
                     raise
@@ -4002,11 +3685,12 @@ class OpenAIBackendAPI:
                             "event": "image_download_retry",
                             "reason": failure.code,
                             "url_host": urlparse(url).netloc,
+                            "error": diagnostic_excerpt(repr(exc), 300),
                         })
                         continue
                     raise ImageDownloadError(
-                        "image download failed",
-                        failure=failure if failure.capability == "auth" else image_failure("image_download_failed"),
+                        f"image download failed: {diagnostic_excerpt(exc, 500)}",
+                        failure=failure,
                     ) from exc
         return images
 
@@ -4063,10 +3747,7 @@ class OpenAIBackendAPI:
         self._report_progress("bootstrapping")
         self._bootstrap()
         self._report_progress("getting_token")
-        requirements = self._get_chat_requirements(
-            deadline=self.deadline_monotonic,
-            timeout_message="image request deadline exceeded",
-        )
+        requirements = self._get_chat_requirements()
         self._report_progress("preparing_conversation")
         conduit_token = self._prepare_image_conversation(prompt, requirements, model)
         self._report_progress("starting_generation")
@@ -4130,9 +3811,7 @@ class OpenAIBackendAPI:
         prepare_data = response.json()
 
         if (prepare_data.get("arkose") or {}).get("required"):
-            raise HumanVerificationRequiredError(
-                "chat requirements requires arkose token, which is not implemented"
-            )
+            raise RuntimeError("chat requirements requires arkose token, which is not implemented")
 
         proof_token = ""
         proof_info = prepare_data.get("proofofwork") or {}
@@ -4145,10 +3824,10 @@ class OpenAIBackendAPI:
                 data_build=self.pow_data_build,
             )
 
-        turnstile_token = self._resolve_turnstile_requirement(
-            prepare_data.get("turnstile") or {},
-            p_token,
-        )
+        turnstile_token = ""
+        turnstile_info = prepare_data.get("turnstile") or {}
+        if turnstile_info.get("required") and turnstile_info.get("dx"):
+            turnstile_token = solve_turnstile_token(turnstile_info["dx"], p_token) or ""
 
         finalize_path = base + "/finalize"
         response = self.session.post(
@@ -4164,15 +3843,9 @@ class OpenAIBackendAPI:
         ensure_ok(response, "chat_requirements_finalize")
         data = response.json()
 
-        if (data.get("arkose") or {}).get("required"):
-            raise HumanVerificationRequiredError(
-                "chat requirements finalize requires arkose token"
-            )
         token = data.get("token", "")
         if not token:
             message = "missing auth chat requirements token" if self.access_token else "missing chat requirements token"
-            if (prepare_data.get("turnstile") or {}).get("required") or (data.get("turnstile") or {}).get("required"):
-                raise HumanVerificationRequiredError(f"{message}: {data}")
             raise RuntimeError(f"{message}: {data}")
 
         return ChatRequirements(

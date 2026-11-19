@@ -74,10 +74,6 @@ metadata writes. It does not serialize upstream calls across processes.
 See [critical-flows.md](critical-flows.md#upstream-account-memory-maintenance)
 for verification and protocol evidence.
 
-### Manual invalid-account cleanup
-
-`GET /api/accounts/invalid-cleanup` previews matching Upstream Account IDs and counts across the pool. `POST /api/accounts/invalid-cleanup` accepts the confirmed IDs. `AccountService` rechecks eligibility under the account lock and uses the existing batch deletion transaction. A repository revision conflict aborts the deletion and returns HTTP 409 so the administrator can preview again.
-
 ## Domain and persistence ownership
 
 | Domain | Owning Module | Stable Interface/output | Persistence |

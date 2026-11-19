@@ -262,34 +262,6 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
     }
   }
 
-  async function clearInvalidAccounts() {
-    try {
-      const preview = await accountsApi.previewInvalidAccountCleanup()
-      const total = preview.account_ids.length
-      if (!total) {
-        toast.info('没有需要清除的账号')
-        return
-      }
-
-      const confirmed = await confirmDialog.ask({
-        title: '清除失效账号',
-        message: `将从全部分页永久删除 ${total} 个失效账号。`,
-        confirmText: '确认清除',
-        cancelText: '取消',
-      })
-      if (!confirmed) return
-
-      const result = await accountsApi.deleteInvalidAccounts(preview.account_ids)
-      options.accountSelection.removeSelectedIds(result.removed_ids)
-      await options.loadData({ silentErrorToast: true })
-      const message = `已清除 ${result.removed} 个账号${result.skipped ? `，跳过 ${result.skipped} 个` : ''}`
-      if (result.removed) toast.success(message)
-      else toast.info(message)
-    } catch (error) {
-      options.setError('清除失效账号失败', error)
-    }
-  }
-
   function requestStopRefreshProgress() {
     options.bulkProgress.requestStop()
   }
@@ -298,6 +270,5 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
     requestStopRefreshProgress,
     runBulkAction,
     bindSelectedAccountsToGroup,
-    clearInvalidAccounts,
   }
 }

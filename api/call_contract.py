@@ -169,8 +169,6 @@ class AttemptSummary(BaseModel):
     status: str
     outcome: CallOutcome
     result_status: AttemptResultStatus
-    result_image_count: int = Field(default=0, ge=0)
-    result_disposition: Literal["", "superseded"] = ""
     duration_ms: int = Field(ge=0)
     status_code: int = Field(ge=0)
     error_code: str

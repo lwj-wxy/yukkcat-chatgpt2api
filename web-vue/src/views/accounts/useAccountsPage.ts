@@ -86,7 +86,7 @@ export function useAccountsPage() {
     { label: '全部状态', value: 'all' },
     { label: '正常', value: 'normal' },
     { label: '限流', value: 'limited' },
-    { label: '失效', value: 'abnormal' },
+    { label: '异常', value: 'abnormal' },
     { label: '禁用', value: 'disabled' },
   ] as const
 
@@ -268,7 +268,6 @@ export function useAccountsPage() {
     runBatchInteraction(() => accountBulkActions.runBulkAction(...args))
   )
   const bindSelectedAccountsToGroup = () => runBatchInteraction(accountBulkActions.bindSelectedAccountsToGroup)
-  const clearInvalidAccounts = () => runBatchInteraction(accountBulkActions.clearInvalidAccounts)
 
   async function copyAccountCredential(item: Account, kind: 'access' | 'refresh') {
     const label = kind === 'access' ? 'AT' : 'RT'
@@ -536,7 +535,6 @@ export function useAccountsPage() {
     runBulkAction,
     runMemoryAction,
     bindSelectedAccountsToGroup,
-    clearInvalidAccounts,
     exportAccounts,
   }
 }

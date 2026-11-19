@@ -119,10 +119,6 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
         "account", "auth", False, 401, "authentication_error",
         verify_account=True,
     ),
-    "verification_required": FailurePolicy(
-        "account", "human_verification", False, 403, "permission_error",
-        verify_account=True,
-    ),
     "content_policy_violation": FailurePolicy(
         "request", None, False, 400, "invalid_request_error",
     ),
@@ -154,12 +150,8 @@ FAILURE_POLICIES: dict[str, FailurePolicy] = {
 
 
 FAILURE_CODE_ALIASES = {
-    "arkose_required": "verification_required",
-    "captcha_required": "verification_required",
-    "challenge_required": "verification_required",
     "connection_failed": "upstream_connection_failed",
     "connection_timeout": "upstream_connection_timeout",
-    "human_verification_required": "verification_required",
     "image_stream_interrupted": "image_stream_interrupted",
     "invalid_access_token": "auth_invalid",
     "moderation_blocked": "content_policy_violation",
@@ -246,7 +238,6 @@ def image_failure(
 IMAGE_TIMEOUT_PUBLIC_MESSAGE = "Image generation timed out. Please try again."
 IMAGE_TOOL_ERROR_PUBLIC_MESSAGE = "The image generation tool encountered an error. Please try again."
 IMAGE_QUOTA_PUBLIC_MESSAGE = "No image generation quota is currently available."
-IMAGE_VERIFICATION_PUBLIC_MESSAGE = "Upstream human verification is required for the selected account. Please try again."
 
 _PUBLIC_RAW_DETAIL_CODES = frozenset({
     "content_policy_violation",
@@ -352,8 +343,6 @@ def public_image_error_message(
         return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
     if failure.code in {"image_quota_exhausted", "insufficient_quota"}:
         return IMAGE_QUOTA_PUBLIC_MESSAGE
-    if failure.code == "verification_required":
-        return IMAGE_VERIFICATION_PUBLIC_MESSAGE
     return IMAGE_TOOL_ERROR_PUBLIC_MESSAGE
 
 
@@ -378,10 +367,6 @@ class ImageFailureError(RuntimeError):
 
 class InvalidAccessTokenError(ImageFailureError):
     failure_code = "auth_invalid"
-
-
-class HumanVerificationRequiredError(ImageFailureError):
-    failure_code = "verification_required"
 
 
 class ImagePollTimeoutError(ImageFailureError):
@@ -477,13 +462,6 @@ def structured_upstream_codes(value: Any) -> set[str]:
 
 QUOTA_CODES = {"insufficient_quota", "quota_exhausted", "image_quota_exhausted"}
 AUTH_CODES = {"invalid_access_token", "token_invalid", "token_invalidated", "token_revoked"}
-VERIFICATION_CODES = {
-    "arkose_required",
-    "captcha_required",
-    "challenge_required",
-    "human_verification_required",
-    "verification_required",
-}
 POLICY_CODES = {"content_policy_violation", "moderation_blocked", "safety_blocked"}
 
 
@@ -491,7 +469,7 @@ def _failure_priority(code: str) -> int:
     normalized = FAILURE_CODE_ALIASES.get(str(code or "").strip().lower(), str(code or "").strip().lower())
     if normalized == "auth_invalid":
         return 8
-    if normalized in {"image_quota_exhausted", "insufficient_quota", "verification_required"}:
+    if normalized in {"image_quota_exhausted", "insufficient_quota"}:
         return 7
     if normalized in {"file_upload_throttled", "upstream_rate_limited"}:
         return 6
@@ -537,14 +515,12 @@ def _classify_structured_failure_codes(
         known_codes.add("content_policy_violation")
     if normalized_codes.intersection(AUTH_CODES):
         known_codes.add("auth_invalid")
-    if normalized_codes.intersection(VERIFICATION_CODES):
-        known_codes.add("verification_required")
     if normalized_codes.intersection(QUOTA_CODES):
         known_codes.add("image_quota_exhausted")
     known_codes.update(
         FAILURE_CODE_ALIASES.get(code, code)
         for code in normalized_codes
-        if code not in POLICY_CODES | AUTH_CODES | VERIFICATION_CODES | QUOTA_CODES
+        if code not in POLICY_CODES | AUTH_CODES | QUOTA_CODES
         and FAILURE_CODE_ALIASES.get(code, code) in FAILURE_POLICIES
     )
     if any(is_rate_limit_failure_code(code) for code in normalized_codes):
@@ -624,11 +600,6 @@ def classify_upstream_http_error(exc: UpstreamHTTPError) -> ImageFailure:
 
     if status_code == 401:
         return image_failure("auth_invalid", retry_after=retry_after, raw_detail=exc.body)
-    if (
-        structured_failure is not None
-        and structured_failure.code == "verification_required"
-    ):
-        return replace(structured_failure, status_code=status_code)
     if (
         structured_failure is not None
         and structured_failure.code == "conversation_not_ready"
@@ -878,7 +849,7 @@ def classify_task_failure(task: Any) -> ImageFailure | None:
     return None
 
 
-def current_conversation_turn(data: Any) -> list[Mapping[str, Any]]:
+def _current_conversation_turn(data: Any) -> list[Mapping[str, Any]]:
     data_map = _mapping(data)
     mapping = _mapping(data_map.get("mapping"))
     messages: list[Mapping[str, Any]] = []
@@ -921,7 +892,7 @@ def current_conversation_turn(data: Any) -> list[Mapping[str, Any]]:
 
 
 def terminal_assistant_text(data: Any) -> str:
-    for message in reversed(current_conversation_turn(data)):
+    for message in reversed(_current_conversation_turn(data)):
         role = str(_mapping(message.get("author")).get("role") or "").strip().lower()
         content = _mapping(message.get("content"))
         content_type = str(content.get("content_type") or "").strip().lower()
@@ -937,7 +908,7 @@ def terminal_assistant_text(data: Any) -> str:
 
 
 def classify_conversation_failure(data: Any) -> ImageFailure | None:
-    current_turn = current_conversation_turn(data)
+    current_turn = _current_conversation_turn(data)
     if any(_message_has_image_output(message) for message in current_turn):
         return None
 

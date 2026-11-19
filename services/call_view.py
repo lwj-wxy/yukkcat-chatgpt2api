@@ -32,7 +32,6 @@ _IMAGE_FAILURE_LABELS = {
     "image_quota_exhausted": "图片额度已用尽",
     "file_upload_throttled": "参考图上传受限",
     "auth_invalid": "账号登录态失效",
-    "verification_required": "账号需人工验证",
     "content_policy_violation": "内容安全策略拒绝",
     "invalid_image_input": "图片输入无效",
     "upstream_text_reply": "上游仅返回文本",
@@ -271,9 +270,7 @@ def call_image_counts(item: Mapping[str, Any]) -> tuple[int, int, int, str]:
     succeeded_slots = {
         _int(attempt.get("slot"))
         for attempt in attempts
-        if _clean(attempt.get("status")).lower() == "success"
-        and attempt.get("result_disposition") != "superseded"
-        and _int(attempt.get("slot")) > 0
+        if _clean(attempt.get("status")).lower() == "success" and _int(attempt.get("slot")) > 0
     }
     result_count = max(
         _int(_value(item, "result_data_count")),
@@ -431,9 +428,6 @@ def build_attempt_summary(value: Mapping[str, Any]) -> dict[str, Any]:
         status_presentation = {"label": "生成成功", "tone": "warning"}
     else:
         status_presentation = _status_presentation({"outcome": outcome})
-    superseded = attempt.get("result_disposition") == "superseded"
-    if superseded:
-        status_presentation = {"label": "未采用", "tone": "muted"}
     summary = {
         "slot": max(1, _int(attempt.get("slot"))),
         "attempt": max(1, _int(attempt.get("attempt"))),
@@ -442,8 +436,6 @@ def build_attempt_summary(value: Mapping[str, Any]) -> dict[str, Any]:
         "status": _clean(attempt.get("status")),
         "outcome": outcome,
         "result_status": result_status,
-        "result_image_count": max(0, _int(attempt.get("result_image_count"))),
-        "result_disposition": "superseded" if superseded else "",
         "duration_ms": duration_ms,
         "status_code": _int(attempt.get("status_code")),
         "error_code": error_code,
@@ -480,7 +472,7 @@ def build_attempt_summary(value: Mapping[str, Any]) -> dict[str, Any]:
         "timeline": build_request_timeline_presentation(
             timings,
             monitor.get("events"),
-            image_count=max(1, summary["result_image_count"]),
+            image_count=1,
         ),
     }
     return summary
@@ -659,25 +651,16 @@ def _attempt_group_presentations(
 
     result: list[dict[str, Any]] = []
     slot_count = max(requested_count, max(grouped, default=0))
-    has_group = any(_int(attempt.get("result_image_count")) > 1 for attempt in attempts)
     for slot in range(1, slot_count + 1):
-        if has_group and slot not in grouped:
-            continue
         slot_attempts = grouped.get(slot, [])
         attempt_count = len(slot_attempts)
         switch_count = sum(1 for attempt in slot_attempts if attempt.get("switched_account") is True)
         succeeded = any(_clean(attempt.get("result_status")) == "success" for attempt in slot_attempts)
-        result_count = max((
-            _int(attempt.get("result_image_count")) for attempt in slot_attempts
-            if _clean(attempt.get("result_status")) == "success"
-        ), default=0)
         delivery_failed = any(
             _clean(attempt.get("result_status")) == "generated_but_delivery_failed"
             for attempt in slot_attempts
         )
-        if slot_attempts and all(attempt.get("result_disposition") == "superseded" for attempt in slot_attempts):
-            status = {"label": "未采用", "tone": "muted"}
-        elif succeeded:
+        if succeeded:
             status = {"label": "成功", "tone": "success"}
         elif delivery_failed:
             status = {"label": "生成成功", "tone": "warning"}
@@ -688,9 +671,7 @@ def _attempt_group_presentations(
         result.append(
             {
                 "slot": slot,
-                "slot_label": (
-                    f"图片 1–{result_count}" if result_count > 1 else f"图片 {slot}"
-                ),
+                "slot_label": f"图片 {slot}",
                 "attempt_count": attempt_count,
                 "attempt_text": f"{attempt_count} 次尝试",
                 "switch_count": switch_count,
