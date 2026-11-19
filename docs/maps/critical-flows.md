@@ -111,20 +111,13 @@ terminal state. `ImageStorageService` exclusively owns Image Asset catalogue and
 storage mutations. Studio owns browser conversation presentation and polling,
 not task truth.
 
-For multi-image Web edits, the gateway sends the brief, requested count and a numbered
-preview of the references to the existing multimodal text backend. Planning has a
-15-second limit within the request deadline. An independent plan must supply one
-instruction and valid reference indices for each requested output. Each worker gets
-its own original references and one output slot. The image pool runs these workers
-according to the parallel-generation setting. Direct streaming preserves slot indices
-when workers finish out of order. For coordinated edits, invalid plans, or an unavailable
-planner, the gateway selects the largest result from one execution under the shared deadline.
-Separate executions cannot contribute different pieces of one split image. Direct streaming
-requires the complete requested count before reporting batch completion. Accounts that hit
-an explicit upstream human-verification requirement before emitting output are marked
-`verification_required` (projected as pending verification rather than invalid credentials,
-and excluded from scheduling and automatic deletion) while planning, independent slots, and
-grouped sessions switch to another eligible Upstream Account within the request deadline.
+Multi-image Web reference edits enter the grouped edit path directly with the
+original references, prompt and requested count. When a complete group is available,
+the gateway delivers it from one execution. Direct streaming preserves file indices
+and requires the requested count before reporting batch completion. Generation
+without references and Codex requests follow the configured concurrency policy.
+Upstream Accounts marked `verification_required` are excluded from scheduling
+and automatic deletion.
 `OpenAIBackendAPI` resolves final assistant sandbox images through their
 conversation and message IDs, validates downloads, and hands bytes to the
 existing image formatting/storage path. Missing file URLs are retried in the

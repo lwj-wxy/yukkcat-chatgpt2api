@@ -212,21 +212,6 @@ class EditableFileExportResult:
     zip_path: Path
 
 
-class _DeadlineSession(requests.Session):
-    """Limit each HTTP call, including streamed reads, to the remaining budget."""
-
-    def __init__(self, deadline, **kwargs):
-        super().__init__(**kwargs)
-        self.deadline = deadline
-
-    def request(self, method, url, **kwargs):
-        remaining = self.deadline - time.monotonic()
-        if remaining <= 0:
-            raise TimeoutError("conversation deadline exceeded")
-        self.curl_options[CurlOpt.TIMEOUT_MS] = max(1, int(remaining * 1000))
-        return super().request(method, url, **kwargs)
-
-
 class OpenAIBackendAPI:
     """ChatGPT Web 后端封装。
 
@@ -247,7 +232,6 @@ class OpenAIBackendAPI:
             proxy: str = "",
             proxy_url: str | None = None,
             deadline_monotonic: float | None = None,
-            limit_http_to_deadline: bool = False,
     ) -> None:
         """初始化后端客户端。
 
@@ -283,16 +267,12 @@ class OpenAIBackendAPI:
             deadline_monotonic=deadline_monotonic,
         )
         try:
-            session_kwargs = proxy_settings.build_session_kwargs_from_profile(
+            self.session = requests.Session(**proxy_settings.build_session_kwargs_from_profile(
                 self.proxy_profile,
                 impersonate=self.fp["impersonate"],
                 verify=True,
                 curl_infos=list(HTTP_TIMING_INFOS),
-            )
-            if limit_http_to_deadline and deadline_monotonic is not None:
-                self.session = _DeadlineSession(deadline_monotonic, **session_kwargs)
-            else:
-                self.session = requests.Session(**session_kwargs)
+            ))
         except Exception:
             if bool(getattr(self.proxy_profile, "image_egress_reserved", False)):
                 proxy_settings.release_image_egress(self.proxy_profile)

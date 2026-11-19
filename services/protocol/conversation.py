@@ -6,7 +6,6 @@ import io
 import json
 import re
 import time
-from contextlib import closing
 from threading import Lock
 from concurrent.futures import (
     ThreadPoolExecutor,
@@ -47,7 +46,6 @@ from services.image_storage_service import image_media_type, image_storage_servi
 from services.image_upscale_service import upscale_image_if_needed
 from services.openai_backend_api import OpenAIBackendAPI, SANDBOX_IMAGE_RE
 from services.proxy_service import ImageEgressDeadlineError, proxy_settings
-from services.protocol.image_edit_plan import plan_image_edits
 from services.realtime_monitor_service import realtime_monitor_service
 from utils.helper import (
     IMAGE_MODELS,
@@ -3098,56 +3096,6 @@ def _select_image_pool_error(errors: dict[int, Exception]) -> Exception | None:
     return selected
 
 
-def _read_edit_plan(messages: list[dict], deadline: float) -> str:
-    attempted_tokens: set[str] = set()
-    auth_failures = 0
-    verification_switches = 0
-    while time.monotonic() < deadline:
-        token = account_service.get_text_access_token(attempted_tokens)
-        if not token or token in attempted_tokens:
-            raise RuntimeError("edit planner unavailable")
-        attempted_tokens.add(token)
-        account_snapshot = account_service.get_account(token) or {}
-        try:
-            with OpenAIBackendAPI(
-                access_token=token,
-                deadline_monotonic=deadline,
-                limit_http_to_deadline=True,
-            ) as backend:
-                with closing(backend.stream_conversation(messages=messages, model="auto")) as stream:
-                    reply = ""
-                    for event in iter_conversation_payloads(
-                        stream, classify_terminal_text_as_image_failure=False
-                    ):
-                        if time.monotonic() >= deadline:
-                            raise TimeoutError("edit planning timed out")
-                        structured_failure = event.get("_image_failure")
-                        if isinstance(structured_failure, ImageFailure):
-                            raise ImageFailureError(failure=structured_failure)
-                        if event.get("blocked"):
-                            raise ValueError("edit plan unavailable")
-                        reply = event["text"]
-                        if len(reply) > 32768:
-                            raise ValueError("oversized edit plan")
-            account_service.mark_text_used(token)
-            return reply
-        except Exception as exc:
-            rejection = _record_text_account_rejection(
-                token,
-                account_snapshot,
-                exc,
-                "image_edit_plan",
-            )
-            if rejection == "verification_required" and verification_switches < 20:
-                verification_switches += 1
-                continue
-            if rejection == "auth" and auth_failures < 2:
-                auth_failures += 1
-                continue
-            raise
-    raise TimeoutError("edit planning timed out")
-
-
 def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageOutput]:
     """Only deliver files from one execution, even if all attempts are incomplete."""
     if request.file_ready:
@@ -3223,7 +3171,7 @@ def _stream_grouped_image_edits(request: ConversationRequest) -> Iterator[ImageO
 
 
 def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[ImageOutput]:
-    """Schedule independent images by slot and keep coordinated edits together."""
+    """Run Web reference edits as a group and schedule other image requests by slot."""
     normalized_output_format = normalize_image_output_format(request.output_format)
     validate_image_output_request(
         request.model,
@@ -3286,26 +3234,11 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
             yield output
         return
 
-    slots = None
     if request.images and not is_codex_image_model(request.model):
-        started = time.monotonic()
-        slots, reason = plan_image_edits(request.prompt, request.images, request.n,
-                                        request.deadline_monotonic, _read_edit_plan)
-        logger.info({"event": "image_edit_routing", "call_id": request.call_id, "reason": reason,
-                     "n": request.n, "reference_count": len(request.images),
-                     "planning_ms": round((time.monotonic() - started) * 1000)})
-        if slots is None:
-            yield from _stream_grouped_image_edits(request)
-            return
+        yield from _stream_grouped_image_edits(request)
+        return
 
-    def worker_request(index: int) -> ConversationRequest:
-        if slots is None:
-            return replace(request, n=1)
-        slot = slots[index - 1]
-        return replace(request, n=1, images=[request.images[i - 1] for i in slot.references],
-                       prompt=(f"{request.prompt}\n\n本次只交付第 {index}/{request.n} 张图片。"
-                               f"附图对应原参考图编号 {list(slot.references)}。本张要求：{slot.instruction}"))
-
+    # Generation without references and Codex retain their concurrency policy.
     if not config.image_parallel_generation:
         logger.info({
             "event": "image_serial_generation_start",
@@ -3316,7 +3249,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
         errors: dict[int, Exception] = {}
         for index in range(1, request.n + 1):
             try:
-                outputs = _generate_single_image(worker_request(index), index, request.n)
+                outputs = _generate_single_image(replace(request, n=1), index, request.n)
             except Exception as exc:
                 _capture_failed_image_attempts(request, exc)
                 errors[index] = exc
@@ -3386,7 +3319,7 @@ def stream_image_outputs_with_pool(request: ConversationRequest) -> Iterator[Ima
 
     try:
         for index in range(1, request.n + 1):
-            future = executor.submit(_generate_single_image, worker_request(index), index, request.n)
+            future = executor.submit(_generate_single_image, replace(request, n=1), index, request.n)
             futures[future] = index
 
         # yield 结果：按完成顺序立即输出，不再等所有图片都结束后才返回成功结果。
